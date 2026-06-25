@@ -30,6 +30,17 @@ pub enum Item {
     Mod(ModDef),
     /// A `use path::to::item;` (or `use path::*;`) import.
     Use(UseDecl),
+    /// A compile-time constant `const NAME: T = expr;`.
+    Const(ConstDecl),
+}
+
+/// A `const NAME: T = value;` declaration. `value` is evaluated at compile time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstDecl {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// A dotted/`::`-separated name path, e.g. `math::clamp` → `["math", "clamp"]`.

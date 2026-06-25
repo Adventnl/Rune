@@ -295,7 +295,11 @@ fn scan_place(place: &crate::ir::Place, uses_print: &mut bool, uses_while: &mut 
 
 fn scan_expr(expr: &Expr, uses_print: &mut bool, uses_while: &mut bool) {
     match &expr.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Local(_) => {}
+        ExprKind::Int(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Local(_)
+        | ExprKind::ConstRef(_) => {}
         ExprKind::Unary { expr, .. } => scan_expr(expr, uses_print, uses_while),
         ExprKind::Binary { lhs, rhs, .. } => {
             scan_expr(lhs, uses_print, uses_while);
@@ -413,7 +417,11 @@ fn collect_calls_place(place: &crate::ir::Place, out: &mut BTreeSet<String>) {
 
 fn collect_calls_expr(expr: &Expr, out: &mut BTreeSet<String>) {
     match &expr.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Local(_) => {}
+        ExprKind::Int(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Local(_)
+        | ExprKind::ConstRef(_) => {}
         ExprKind::Unary { expr, .. } => collect_calls_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, out);

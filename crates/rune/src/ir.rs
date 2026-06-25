@@ -102,6 +102,17 @@ pub struct Module {
     pub structs: BTreeMap<String, StructDef>,
     pub enums: BTreeMap<String, EnumDef>,
     pub funcs: BTreeMap<String, Func>,
+    /// Compile-time constants, keyed by fully-qualified name.
+    pub consts: BTreeMap<String, ConstDef>,
+}
+
+/// A typed compile-time constant. `init` is a closed expression evaluated once
+/// (and memoised) by the interpreter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstDef {
+    pub name: String,
+    pub ty: Type,
+    pub init: Expr,
 }
 
 /// A typed struct definition with an ordered field layout.
@@ -278,6 +289,8 @@ pub enum ExprKind {
     Unit,
     /// A reference to a local variable or parameter.
     Local(String),
+    /// A reference to a compile-time constant by fully-qualified name.
+    ConstRef(String),
     /// Unary operation.
     Unary { op: UnOp, expr: Box<Expr> },
     /// Binary operation. Operand and result types are determined and checked.

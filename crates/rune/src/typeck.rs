@@ -51,6 +51,7 @@ pub fn check(program: &ast::Program) -> Result<ir::Module, Vec<Diagnostic>> {
     module.structs = cx.structs.clone();
     module.enums = cx.enums.clone();
     cx.check_bodies(&program.items, &root, &mut module);
+    module.consts = cx.consts.clone();
 
     if cx.diags.is_empty() {
         Ok(module)
@@ -65,12 +66,14 @@ enum ItemKind {
     Struct,
     Enum,
     Func,
+    Const,
 }
 
 struct Checker {
     structs: BTreeMap<String, ir::StructDef>,
     enums: BTreeMap<String, ir::EnumDef>,
     funcs: HashMap<String, ir::Signature>,
+    consts: BTreeMap<String, ir::ConstDef>,
     /// Fully-qualified item name -> what kind of item it is.
     kinds: HashMap<String, ItemKind>,
     /// Set of fully-qualified module names that exist.
@@ -99,6 +102,7 @@ impl Checker {
             structs: BTreeMap::new(),
             enums: BTreeMap::new(),
             funcs: HashMap::new(),
+            consts: BTreeMap::new(),
             kinds: HashMap::new(),
             modules: std::collections::HashSet::new(),
             uses: HashMap::new(),
@@ -120,6 +124,7 @@ impl Checker {
                 ast::Item::Struct(s) => self.register_named(&s.name, ItemKind::Struct, cur, s.span),
                 ast::Item::Enum(e) => self.register_named(&e.name, ItemKind::Enum, cur, e.span),
                 ast::Item::Func(f) => self.register_named(&f.name, ItemKind::Func, cur, f.span),
+                ast::Item::Const(c) => self.register_named(&c.name, ItemKind::Const, cur, c.span),
                 ast::Item::Mod(m) => {
                     let mfqn = fqn(cur, &m.name);
                     self.modules.insert(mfqn);
@@ -174,7 +179,7 @@ impl Checker {
                     },
                 );
             }
-            ItemKind::Func => {}
+            ItemKind::Func | ItemKind::Const => {}
         }
     }
 
@@ -248,6 +253,22 @@ impl Checker {
                     };
                     self.funcs.insert(f, ir::Signature { params, ret });
                 }
+                ast::Item::Const(c) => {
+                    let f = fqn(cur, &c.name);
+                    let ty = self
+                        .resolve_ty(&c.ty, cur, c.span)
+                        .unwrap_or(Type::Unit);
+                    // The value is checked in pass 3 (when all signatures exist);
+                    // store the type now so references resolve.
+                    self.consts.insert(
+                        f.clone(),
+                        ir::ConstDef {
+                            name: f,
+                            ty,
+                            init: ir::Expr::new(ir::ExprKind::Unit, Type::Unit),
+                        },
+                    );
+                }
                 ast::Item::Mod(m) => {
                     if let Some(inner) = &m.items {
                         let mut child = cur.to_vec();
@@ -271,6 +292,28 @@ impl Checker {
                         Ok(func) => {
                             module.funcs.insert(func.name.clone(), func);
                         }
+                        Err(d) => self.diags.push(d),
+                    }
+                }
+                ast::Item::Const(c) => {
+                    self.cur_mod = cur.to_vec();
+                    self.scopes = vec![HashMap::new()];
+                    let f = fqn(cur, &c.name);
+                    let ty = self.consts[&f].ty.clone();
+                    match self.check_expr(&c.value, Some(&ty)) {
+                        Ok(init) if init.ty == ty => {
+                            if let Some(cd) = self.consts.get_mut(&f) {
+                                cd.init = init;
+                            }
+                        }
+                        Ok(init) => self.diags.push(Diagnostic::new(
+                            Stage::Type,
+                            format!(
+                                "const `{}` declared `{}` but its value has type `{}`",
+                                f, ty, init.ty
+                            ),
+                            c.span,
+                        )),
                         Err(d) => self.diags.push(d),
                     }
                 }
@@ -417,6 +460,13 @@ impl Checker {
                     return Err(Diagnostic::new(
                         Stage::Type,
                         format!("`{}` is a function, not a type", f),
+                        span,
+                    ))
+                }
+                Some((f, ItemKind::Const)) => {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        format!("`{}` is a constant, not a type", f),
                         span,
                     ))
                 }
@@ -928,13 +978,23 @@ impl Checker {
                 local.ty.clone(),
             ));
         }
-        self.check_unit_variant(&[name.to_string()], span)
+        self.check_value_path(&[name.to_string()], span)
     }
 
-    /// A path used as a value: must be a unit-like enum variant (there are no
-    /// module-level constants in v1).
+    /// A path used as a value: a compile-time constant or a unit-like enum
+    /// variant.
     fn check_path(&mut self, segments: &[String], span: Span) -> Result<ir::Expr, Diagnostic> {
-        self.check_unit_variant(segments, span)
+        self.check_value_path(segments, span)
+    }
+
+    fn check_value_path(&mut self, path: &[String], span: Span) -> Result<ir::Expr, Diagnostic> {
+        let cur = self.cur_mod.clone();
+        // A compile-time constant.
+        if let Some((cfqn, ItemKind::Const)) = self.resolve_item(&cur, path) {
+            let ty = self.consts[&cfqn].ty.clone();
+            return Ok(ir::Expr::new(ir::ExprKind::ConstRef(cfqn), ty));
+        }
+        self.check_unit_variant(path, span)
     }
 
     fn check_unit_variant(&mut self, path: &[String], span: Span) -> Result<ir::Expr, Diagnostic> {

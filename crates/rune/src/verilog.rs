@@ -1115,6 +1115,18 @@ impl<'a> Lowerer<'a> {
                     width,
                 })
             }
+            // Compile-time constants fold to a sized literal.
+            ir::ExprKind::ConstRef(name) => {
+                let width = ty_width(&e.ty, self.module)?;
+                let value = const_scalar_value(self.module, name)?;
+                Ok(Net {
+                    expr: Expr::Const {
+                        value: value & mask(width),
+                        width,
+                    },
+                    width,
+                })
+            }
             ir::ExprKind::Bool(b) => Ok(Net {
                 expr: Expr::Const {
                     value: *b as u128,
@@ -1678,6 +1690,17 @@ impl<'a> Lowerer<'a> {
                 Err("tuple patterns in `match` are not yet supported by codegen".to_string())
             }
         }
+    }
+}
+
+/// Evaluate a scalar (`bit<N>`/`bool`) compile-time constant to its bits.
+fn const_scalar_value(module: &ir::Module, name: &str) -> Result<u128, String> {
+    let mut interp = crate::interp::Interpreter::new(module.clone());
+    match interp.eval_const(name).map_err(|d| d.message)? {
+        crate::interp::Value::Bit(v, _) => Ok(v),
+        crate::interp::Value::Int(v, _) => Ok(v as u128),
+        crate::interp::Value::Bool(b) => Ok(b as u128),
+        _ => Err(format!("const `{}` is not a scalar hardware value", name)),
     }
 }
 

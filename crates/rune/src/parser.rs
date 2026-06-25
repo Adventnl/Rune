@@ -100,8 +100,9 @@ impl<'a> Parser<'a> {
             Tok::Enum => self.enum_def().map(Item::Enum),
             Tok::Mod => self.mod_def().map(Item::Mod),
             Tok::Use => self.use_decl().map(Item::Use),
+            Tok::Const => self.const_decl().map(Item::Const),
             other => Err(self.err(format!(
-                "expected an item (fn, struct, enum, mod, or use), found {}",
+                "expected an item (fn, struct, enum, mod, use, or const), found {}",
                 describe(other)
             ))),
         }
@@ -128,6 +129,23 @@ impl<'a> Parser<'a> {
         Ok(ModDef {
             name,
             items: Some(items),
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    fn const_decl(&mut self) -> PResult<ConstDecl> {
+        let start = self.span();
+        self.expect(&Tok::Const, "`const`")?;
+        let (name, _) = self.ident()?;
+        self.expect(&Tok::Colon, "`:` in const declaration")?;
+        let ty = self.type_expr()?;
+        self.expect(&Tok::Eq, "`=` in const declaration")?;
+        let value = self.expr()?;
+        self.expect(&Tok::Semi, "`;` after const")?;
+        Ok(ConstDecl {
+            name,
+            ty,
+            value,
             span: start.merge(self.prev_span()),
         })
     }

@@ -60,6 +60,8 @@ type Env = Vec<HashMap<String, Value>>;
 pub struct Interpreter {
     module: ir::Module,
     output: Vec<String>,
+    /// Memoised compile-time constant values (evaluated on first use).
+    const_cache: HashMap<String, Value>,
 }
 
 impl Interpreter {
@@ -67,6 +69,7 @@ impl Interpreter {
         Interpreter {
             module,
             output: Vec::new(),
+            const_cache: HashMap::new(),
         }
     }
 
@@ -78,6 +81,7 @@ impl Interpreter {
     /// Replace the live module (used by hot reload after swapping definitions).
     pub fn set_module(&mut self, module: ir::Module) {
         self.module = module;
+        self.const_cache.clear();
     }
 
     /// All captured `print` lines so far.
@@ -88,6 +92,27 @@ impl Interpreter {
     /// Take and clear the captured output.
     pub fn take_output(&mut self) -> Vec<String> {
         std::mem::take(&mut self.output)
+    }
+
+    /// Evaluate a compile-time constant by fully-qualified name (memoised).
+    pub fn eval_const(&mut self, name: &str) -> Result<Value, Diagnostic> {
+        let Interpreter {
+            module,
+            output,
+            const_cache,
+        } = self;
+        let mut ev = Eval {
+            module,
+            output,
+            const_cache,
+        };
+        let mut env: Env = vec![HashMap::new()];
+        let expr = ir::Expr::new(ir::ExprKind::ConstRef(name.to_string()), ir::Type::Unit);
+        match ev.eval_expr(&expr, &mut env) {
+            Ok(v) => Ok(v),
+            Err(Signal::Return(v)) => Ok(v),
+            Err(Signal::Error(d)) => Err(d),
+        }
     }
 
     /// Run `main()` and return the lines it printed. Errors are returned as a
@@ -106,8 +131,16 @@ impl Interpreter {
 
     /// Call a function by name with already-evaluated argument values.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        let Interpreter { module, output } = self;
-        let mut ev = Eval { module, output };
+        let Interpreter {
+            module,
+            output,
+            const_cache,
+        } = self;
+        let mut ev = Eval {
+            module,
+            output,
+            const_cache,
+        };
         match ev.call_func(name, args) {
             Ok(v) => Ok(v),
             Err(Signal::Return(v)) => Ok(v),
@@ -120,6 +153,7 @@ impl Interpreter {
 struct Eval<'a> {
     module: &'a ir::Module,
     output: &'a mut Vec<String>,
+    const_cache: &'a mut HashMap<String, Value>,
 }
 
 impl<'a> Eval<'a> {
@@ -320,6 +354,21 @@ impl<'a> Eval<'a> {
                 .find_map(|s| s.get(name))
                 .cloned()
                 .ok_or_else(|| rt(&format!("read of unbound variable `{}`", name))),
+            ir::ExprKind::ConstRef(name) => {
+                if let Some(v) = self.const_cache.get(name) {
+                    return Ok(v.clone());
+                }
+                let def = self
+                    .module
+                    .consts
+                    .get(name)
+                    .ok_or_else(|| rt(&format!("reference to unknown const `{}`", name)))?;
+                // Evaluate the closed initializer in a fresh environment.
+                let mut cenv: Env = vec![HashMap::new()];
+                let v = self.eval_expr(&def.init, &mut cenv)?;
+                self.const_cache.insert(name.clone(), v.clone());
+                Ok(v)
+            }
             ir::ExprKind::Unary { op, expr } => {
                 let v = self.eval_expr(expr, env)?;
                 eval_unary(*op, v, &e.ty)
@@ -781,6 +830,24 @@ mod tests {
         let module = compile(src).expect("should typecheck");
         let mut interp = Interpreter::new(module);
         interp.run_main().expect("should run")
+    }
+
+    #[test]
+    fn const_items_evaluate_at_compile_time() {
+        let src = r#"
+            const WIDTH: u32 = 8;
+            const DOUBLE: u32 = WIDTH * 2;
+            const MASK: bit<8> = 0xFF;
+            mod cfg { const VERSION: u32 = 3; }
+            fn masked(x: bit<8>) -> bit<8> { x & MASK }
+            fn main() {
+                print(WIDTH);
+                print(DOUBLE);
+                print(masked(200));
+                print(cfg::VERSION);
+            }
+        "#;
+        assert_eq!(run(src), vec!["8", "16", "200", "3"]);
     }
 
     #[test]

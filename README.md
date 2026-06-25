@@ -32,9 +32,13 @@ stable contract shared by every stage.
   Arithmetic wraps (two's complement) so the interpreter and any future hardware
   agree bit-for-bit. Divide-by-zero and out-of-bounds indexing are defined
   runtime traps.
-- **Code:** functions; exhaustive `match`; `if`/`while`; `for` over a bounded
-  integer range. Integer literals infer their width from context (default
-  `i32`); there are no implicit conversions.
+- **Aggregates:** tuples `(T0, T1)` with `.0` access and destructuring
+  `let (a, b) = ...`; fixed arrays; structs; tagged enums.
+- **Code:** functions; `const` items (compile-time evaluated); exhaustive
+  `match` with guards (`pat if cond`), or-patterns (`a | b`), and range
+  patterns (`0..=9`); `if`/`while`; `for` over a bounded integer range. Integer
+  literals infer their width from context (default `i32`); no implicit
+  conversions.
 - **Namespacing:** `mod` modules (inline or file-based), `use` imports, and
   `::` paths. See *Modules, the standard library, and packages* below.
 
