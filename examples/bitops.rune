@@ -1,0 +1,20 @@
+//! Bit-twiddling on `bit<N>`: wrapping arithmetic, bitwise ops, shifts, and
+//! hex literals. Mirrors hardware-friendly fixed-width semantics.
+
+fn main() {
+    let a: bit<8> = 0xF0;
+    let b: bit<8> = 0x0F;
+
+    print(a | b);   // 255
+    print(a & b);   // 0
+    print(a ^ b);   // 255
+    print(!b);      // 240  (bitwise NOT of 0x0F within 8 bits)
+    print(a >> 4);  // 15
+    print(b << 4);  // 240
+
+    // Wrapping arithmetic on bit<8>.
+    let x: bit<8> = 200;
+    let y: bit<8> = 100;
+    print(x + y);   // 44   (300 mod 256)
+    print(x * 2);   // 144  (400 mod 256)
+}

@@ -1,0 +1,19 @@
+//! Arrays: build, index, mutate elements, sum in a `for` loop, and print whole.
+
+fn main() {
+    let mut a: [u32; 5] = [1, 2, 3, 4, 5];
+
+    // Mutate an element in place.
+    a[0] = 100;
+    print(a);          // [100, 2, 3, 4, 5]
+
+    // Sum via a half-open `for` loop.
+    let mut sum: u32 = 0;
+    for i in 0..5 {
+        sum = sum + a[i];
+    }
+    print(sum);        // 114
+
+    // Index access.
+    print(a[2]);       // 3
+}

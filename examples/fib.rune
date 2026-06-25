@@ -1,0 +1,29 @@
+//! Recursive Fibonacci, plus an iterative version, to show `if/else` as an
+//! expression and ordinary recursion.
+
+fn fib(n: u32) -> u32 {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+fn fib_iter(n: u32) -> u32 {
+    let mut a: u32 = 0;
+    let mut b: u32 = 1;
+    let mut i: u32 = 0;
+    while i < n {
+        let next: u32 = a + b;
+        a = b;
+        b = next;
+        i = i + 1;
+    }
+    a
+}
+
+fn main() {
+    print(fib(10));      // 55
+    print(fib_iter(10)); // 55
+    print(fib(15));      // 610
+}
