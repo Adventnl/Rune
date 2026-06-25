@@ -586,16 +586,35 @@ impl Checker {
                 body,
                 span,
             } => {
-                let lo_ir = self.check_expr(lo, None)?;
-                if !lo_ir.ty.is_integer() {
-                    return Err(Diagnostic::new(
-                        Stage::Type,
-                        format!("for-loop bounds must be integers, found `{}`", lo_ir.ty),
-                        lo.span(),
-                    ));
-                }
-                let hi_ir = self.check_expr(hi, Some(&lo_ir.ty))?;
-                if hi_ir.ty != lo_ir.ty {
+                // Infer the bound type from whichever side is concrete, so a
+                // literal bound adopts the other's type (e.g. `0..n` with
+                // `n: u32` makes `0` a `u32`). Defaults to `i32`.
+                let target: Type = if !is_int_literalish(lo) {
+                    let t = self.check_expr(lo, None)?.ty;
+                    if !t.is_integer() {
+                        return Err(Diagnostic::new(
+                            Stage::Type,
+                            format!("for-loop bounds must be integers, found `{}`", t),
+                            lo.span(),
+                        ));
+                    }
+                    t
+                } else if !is_int_literalish(hi) {
+                    let t = self.check_expr(hi, None)?.ty;
+                    if !t.is_integer() {
+                        return Err(Diagnostic::new(
+                            Stage::Type,
+                            format!("for-loop bounds must be integers, found `{}`", t),
+                            hi.span(),
+                        ));
+                    }
+                    t
+                } else {
+                    I32
+                };
+                let lo_ir = self.check_expr(lo, Some(&target))?;
+                let hi_ir = self.check_expr(hi, Some(&target))?;
+                if lo_ir.ty != hi_ir.ty {
                     return Err(Diagnostic::new(
                         Stage::Type,
                         format!(

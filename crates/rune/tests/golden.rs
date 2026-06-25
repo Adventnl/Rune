@@ -455,10 +455,15 @@ fn examples_compile_and_run() {
         examples_dir.display()
     );
 
+    // Point the loader at the workspace std/ so examples that `use std::...`
+    // resolve. Use `compile_path` so multi-file/module examples work too.
+    let std_dir = std::path::Path::new(manifest).join("../../std");
+    if std_dir.is_dir() {
+        std::env::set_var("RUNE_STD", std_dir);
+    }
+
     for path in entries {
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
-        let module = rune::compile(&src).unwrap_or_else(|diags| {
+        let module = rune::compile_path(&path).unwrap_or_else(|diags| {
             panic!(
                 "example {} failed to compile: {:?}",
                 path.display(),

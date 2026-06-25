@@ -103,14 +103,8 @@ pub fn run_source(src: &str) -> Result<Vec<String>, String> {
 /// Compile a file and print the HDL-subset (synthesizability) report. This is
 /// analysis only — no hardware is generated.
 fn hdl_file(path: &str) -> ExitCode {
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read `{}`: {}", path, e);
-            return ExitCode::FAILURE;
-        }
-    };
-    let module = match rune::compile(&src) {
+    let src = std::fs::read_to_string(path).unwrap_or_default();
+    let module = match rune::compile_path(std::path::Path::new(path)) {
         Ok(m) => m,
         Err(diags) => {
             for d in &diags {

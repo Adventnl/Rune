@@ -1,0 +1,32 @@
+// Modules, `use`, qualified paths, and the standard library.
+// Run from the workspace root:  cargo run -p runec -- run examples/modules.rune
+
+use std::math::clamp_u32;
+
+mod geom {
+    struct Point { x: u32, y: u32 }
+    enum Shape { Circle(u32), Rect(u32, u32) }
+
+    fn area(s: Shape) -> u32 {
+        match s {
+            Circle(r)  => 3 * r * r,
+            Rect(w, h) => w * h,
+        }
+    }
+
+    // Manhattan distance from the origin.
+    fn dist0(p: Point) -> u32 { p.x + p.y }
+}
+
+fn main() {
+    print(clamp_u32(250, 0, 64));                 // 64  (via `use`)
+    print(std::math::gcd_u32(48, 36));            // 12  (fully qualified)
+
+    let p: geom::Point = geom::Point { x: 3, y: 4 };
+    print(geom::dist0(p));                         // 7
+
+    print(geom::area(geom::Shape::Rect(3, 4)));    // 12  (enum-qualified variant)
+    print(geom::area(geom::Shape::Circle(2)));     // 12
+
+    print(std::bits::popcount32(0xFF));            // 8
+}

@@ -1,0 +1,55 @@
+// std::math — small integer helpers.
+//
+// Rune v1 has no generics, so these are monomorphic on `u32` / `i32`. Pick the
+// width that matches your data; the patterns are easy to copy for other widths.
+
+fn min_u32(a: u32, b: u32) -> u32 {
+    if a < b { a } else { b }
+}
+
+fn max_u32(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
+
+fn clamp_u32(x: u32, lo: u32, hi: u32) -> u32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+fn abs_i32(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+
+// Integer exponentiation by a bounded loop. `base^exp` wrapping in u32.
+fn pow_u32(base: u32, exp: u32) -> u32 {
+    let mut acc: u32 = 1;
+    let mut i: u32 = 0;
+    while i < exp {
+        acc = acc * base;
+        i = i + 1;
+    }
+    acc
+}
+
+// Greatest common divisor (Euclid).
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    let mut x: u32 = a;
+    let mut y: u32 = b;
+    while y > 0 {
+        let t: u32 = y;
+        y = x % y;
+        x = t;
+    }
+    x
+}
+
+fn is_even_u32(x: u32) -> bool {
+    x % 2 == 0
+}
+
+fn sum_to_u32(n: u32) -> u32 {
+    let mut s: u32 = 0;
+    for i in 0..n {
+        s = s + i;
+    }
+    s
+}
