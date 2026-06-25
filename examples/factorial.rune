@@ -1,0 +1,18 @@
+//! Iterative factorial using a `while` loop.
+
+fn factorial(n: u32) -> u32 {
+    let mut acc: u32 = 1;
+    let mut i: u32 = n;
+    while i > 0 {
+        acc = acc * i;
+        i = i - 1;
+    }
+    acc
+}
+
+fn main() {
+    print(factorial(0));  // 1
+    print(factorial(1));  // 1
+    print(factorial(5));  // 120
+    print(factorial(10)); // 3628800
+}
