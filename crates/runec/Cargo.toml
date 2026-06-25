@@ -11,3 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 rune = { path = "../rune" }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"

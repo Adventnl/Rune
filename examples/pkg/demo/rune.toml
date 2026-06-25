@@ -1,0 +1,7 @@
+[package]
+name = "demo"
+version = "0.1.0"
+entry = "src/main.rune"
+
+[dependencies]
+mathx = { path = "../mathx" }
