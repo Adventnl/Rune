@@ -25,6 +25,10 @@ fn main() -> ExitCode {
             Some(path) => watch_file(path),
             None => usage_error("usage: runec watch <file.rune>"),
         },
+        Some("hdl") => match args.get(2) {
+            Some(path) => hdl_file(path),
+            None => usage_error("usage: runec hdl <file.rune>"),
+        },
         Some("repl") | None => repl_loop(),
         Some("help") | Some("--help") | Some("-h") => {
             print!("{}", top_usage());
@@ -38,7 +42,8 @@ fn top_usage() -> String {
     format!(
         "Rune {}\n\nusage:\n  runec run <file.rune>     compile and run main()\n  \
          runec repl                start the interactive REPL\n  \
-         runec watch <file.rune>   run main(), then hot-reload on edits\n\n\
+         runec watch <file.rune>   run main(), then hot-reload on edits\n  \
+         runec hdl <file.rune>     report which functions are synthesizable\n\n\
          With no arguments, starts the REPL.\n",
         env!("CARGO_PKG_VERSION")
     )
@@ -85,6 +90,32 @@ pub fn run_source(src: &str) -> Result<Vec<String>, String> {
     })?;
     let mut interp = rune::Interpreter::new(module);
     interp.run_main().map_err(|d| d.render(src))
+}
+
+// ---- hdl ----------------------------------------------------------------
+
+/// Compile a file and print the HDL-subset (synthesizability) report. This is
+/// analysis only — no hardware is generated.
+fn hdl_file(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{}`: {}", path, e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let module = match rune::compile(&src) {
+        Ok(m) => m,
+        Err(diags) => {
+            for d in &diags {
+                eprintln!("{}\n", d.render(&src));
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let reports = rune::hdl::analyze(&module);
+    println!("{}", rune::hdl::report_string(&reports).trim_end());
+    ExitCode::SUCCESS
 }
 
 // ---- repl ---------------------------------------------------------------
