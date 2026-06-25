@@ -1,0 +1,18 @@
+fn add8(a: bit<8>, b: bit<8>) -> bit<8> {
+    a + b            // wrapping: add8(200, 100) == 44
+}
+
+enum Shape { Circle(u32), Rect(u32, u32) }
+
+fn area(s: Shape) -> u32 {
+    match s {
+        Circle(r)   => 3 * r * r,
+        Rect(w, h)  => w * h,
+    }
+}
+
+fn main() {
+    print(add8(200, 100));   // 44
+    print(area(Rect(3, 4))); // 12
+    print(area(Circle(2)));  // 12
+}

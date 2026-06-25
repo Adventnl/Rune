@@ -1,0 +1,13 @@
+[package]
+name = "runec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rune CLI: run files, REPL, hot reload, HDL-subset analysis"
+
+[[bin]]
+name = "runec"
+path = "src/main.rs"
+
+[dependencies]
+rune = { path = "../rune" }

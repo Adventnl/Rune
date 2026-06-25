@@ -1,0 +1,13 @@
+[package]
+name = "rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rune — a small, statically-typed, HDL-friendly systems language (interpreter)"
+
+[lib]
+name = "rune"
+path = "src/lib.rs"
+
+[dev-dependencies]
+insta = "1"
