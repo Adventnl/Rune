@@ -23,6 +23,7 @@ pub mod ir;
 pub mod span;
 
 pub mod lexer;
+pub mod loader;
 pub mod parser;
 pub mod typeck;
 pub mod interp;
@@ -43,3 +44,5 @@ pub fn compile(src: &str) -> Result<ir::Module, Vec<Diagnostic>> {
     let program = parser::parse(&tokens).map_err(|d| vec![d])?;
     typeck::check(&program)
 }
+
+pub use loader::{compile_path, load_program};

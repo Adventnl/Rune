@@ -72,6 +72,33 @@ uses only bounded `for` loops (no `while`), and is non-recursive. The
 `hdl` analysis pass reports which functions qualify and why each non-qualifier
 fails. **No HDL codegen is produced in this project.**
 
+## Modules & fully-qualified names
+
+Definitions may be nested in modules (`mod m { ... }`, inline, or `mod m;`
+loading a sibling `m.rune`). The IR stays flat: every function/struct/enum is
+keyed in `Module::funcs`/`structs`/`enums` by its **fully-qualified name**
+(`math::clamp`, `geom::Point`). Items at the program root keep their bare name,
+so single-file programs are byte-for-byte unchanged.
+
+Name resolution happens entirely in the typechecker, against the enclosing
+module:
+
+1. **Lexical** — a path is tried relative to the current module and each
+   ancestor up to the root (innermost wins).
+2. **`use` aliases** — `use a::b::c;` binds `c`; `use a::b::*;` glob-imports a
+   module's items.
+3. Enum **variants are enum-qualified**: `geom::Shape::Rect`, or bare `Rect` /
+   `Shape::Rect` when the enum is in scope. Variant names need only be unique
+   *per enum* now, not globally.
+
+By the time IR exists, all of this is resolved: IR call targets, type names, and
+enum/struct references are fully-qualified strings. The interpreter and HDL pass
+are unaffected — they just see (qualified) names.
+
+The standard library is a set of `std/*.rune` files; the loader wraps each file
+`math.rune` as `mod math { ... }` under a synthetic `mod std`, so user code can
+`use std::math::clamp;`.
+
 ## Hot reload contract
 
 The IR keeps definitions in name-keyed maps (`Module::funcs`, `structs`,

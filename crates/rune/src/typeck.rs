@@ -32,9 +32,17 @@ const I32: Type = Type::Int(IntTy {
 
 /// Typecheck a program, producing a typed [`ir::Module`] or a list of
 /// diagnostics.
+///
+/// Definitions can be nested in modules (`mod`). Every item is keyed in the IR
+/// by its **fully-qualified name** (e.g. `math::clamp`, `geom::Point`); items at
+/// the program root keep their bare name, so single-file programs are
+/// unaffected. Names are resolved relative to the enclosing module, honouring
+/// `use` imports.
 pub fn check(program: &ast::Program) -> Result<ir::Module, Vec<Diagnostic>> {
     let mut cx = Checker::new();
-    cx.collect(program);
+    let root: Vec<String> = vec![];
+    cx.register_items(&program.items, &root);
+    cx.resolve_defs(&program.items, &root);
     if !cx.diags.is_empty() {
         return Err(cx.diags);
     }
@@ -42,17 +50,7 @@ pub fn check(program: &ast::Program) -> Result<ir::Module, Vec<Diagnostic>> {
     let mut module = ir::Module::default();
     module.structs = cx.structs.clone();
     module.enums = cx.enums.clone();
-
-    for item in &program.items {
-        if let ast::Item::Func(f) = item {
-            match cx.check_func(f) {
-                Ok(func) => {
-                    module.funcs.insert(func.name.clone(), func);
-                }
-                Err(d) => cx.diags.push(d),
-            }
-        }
-    }
+    cx.check_bodies(&program.items, &root, &mut module);
 
     if cx.diags.is_empty() {
         Ok(module)
@@ -61,38 +59,31 @@ pub fn check(program: &ast::Program) -> Result<ir::Module, Vec<Diagnostic>> {
     }
 }
 
-/// Typecheck a single function against an existing set of definitions. Used by
-/// hot reload to re-check just one changed definition.
-pub fn check_func_against(
-    func: &ast::Func,
-    structs: &BTreeMap<String, ir::StructDef>,
-    enums: &BTreeMap<String, ir::EnumDef>,
-    funcs: &BTreeMap<String, ir::Func>,
-) -> Result<ir::Func, Vec<Diagnostic>> {
-    let mut cx = Checker::new();
-    cx.structs = structs.clone();
-    cx.enums = enums.clone();
-    for (name, e) in enums {
-        for (tag, v) in e.variants.iter().enumerate() {
-            cx.variants.insert(v.name.clone(), (name.clone(), tag));
-        }
-    }
-    for (name, f) in funcs {
-        cx.funcs.insert(name.clone(), f.signature());
-    }
-    cx.check_func(func).map_err(|d| vec![d])
+/// The three kinds of named, qualifiable items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemKind {
+    Struct,
+    Enum,
+    Func,
 }
 
 struct Checker {
     structs: BTreeMap<String, ir::StructDef>,
     enums: BTreeMap<String, ir::EnumDef>,
-    /// variant name -> (enum name, tag)
-    variants: HashMap<String, (String, usize)>,
     funcs: HashMap<String, ir::Signature>,
+    /// Fully-qualified item name -> what kind of item it is.
+    kinds: HashMap<String, ItemKind>,
+    /// Set of fully-qualified module names that exist.
+    modules: std::collections::HashSet<String>,
+    /// module key (`::`-joined, "" for root) -> `use` aliases: (simple name -> target path).
+    uses: HashMap<String, Vec<(String, Vec<String>)>>,
+    /// module key -> glob-imported module paths (`use m::*;`).
+    globs: HashMap<String, Vec<Vec<String>>>,
     diags: Vec<Diagnostic>,
 
     // Per-function mutable state.
     scopes: Vec<HashMap<String, Local>>,
+    cur_mod: Vec<String>,
     cur_ret: Type,
 }
 
@@ -107,103 +98,130 @@ impl Checker {
         Checker {
             structs: BTreeMap::new(),
             enums: BTreeMap::new(),
-            variants: HashMap::new(),
             funcs: HashMap::new(),
+            kinds: HashMap::new(),
+            modules: std::collections::HashSet::new(),
+            uses: HashMap::new(),
+            globs: HashMap::new(),
             diags: Vec::new(),
             scopes: Vec::new(),
+            cur_mod: Vec::new(),
             cur_ret: Type::Unit,
         }
     }
 
-    /// First pass: collect type definitions and function signatures so that
-    /// definitions may refer to one another regardless of source order.
-    fn collect(&mut self, program: &ast::Program) {
-        // Structs and enums first (names needed to resolve types).
-        for item in &program.items {
+    // ---- collection passes (module-aware) ------------------------------
+
+    /// Pass 1: register every item's fully-qualified name and kind, every
+    /// module, and every `use` import, recursing into modules.
+    fn register_items(&mut self, items: &[ast::Item], cur: &[String]) {
+        for item in items {
             match item {
-                ast::Item::Struct(s) => {
-                    if self.structs.contains_key(&s.name) || self.enums.contains_key(&s.name) {
-                        self.diags.push(Diagnostic::new(
-                            Stage::Type,
-                            format!("duplicate type `{}`", s.name),
-                            s.span,
-                        ));
-                        continue;
+                ast::Item::Struct(s) => self.register_named(&s.name, ItemKind::Struct, cur, s.span),
+                ast::Item::Enum(e) => self.register_named(&e.name, ItemKind::Enum, cur, e.span),
+                ast::Item::Func(f) => self.register_named(&f.name, ItemKind::Func, cur, f.span),
+                ast::Item::Mod(m) => {
+                    let mfqn = fqn(cur, &m.name);
+                    self.modules.insert(mfqn);
+                    if let Some(inner) = &m.items {
+                        let mut child = cur.to_vec();
+                        child.push(m.name.clone());
+                        self.register_items(inner, &child);
                     }
-                    self.structs.insert(
-                        s.name.clone(),
-                        ir::StructDef {
-                            name: s.name.clone(),
-                            fields: vec![],
-                        },
-                    );
                 }
-                ast::Item::Enum(e) => {
-                    if self.structs.contains_key(&e.name) || self.enums.contains_key(&e.name) {
-                        self.diags.push(Diagnostic::new(
-                            Stage::Type,
-                            format!("duplicate type `{}`", e.name),
-                            e.span,
-                        ));
-                        continue;
+                ast::Item::Use(u) => {
+                    let key = cur.join("::");
+                    if u.glob {
+                        self.globs.entry(key).or_default().push(u.path.clone());
+                    } else if let Some(alias) = u.path.last() {
+                        self.uses
+                            .entry(key)
+                            .or_default()
+                            .push((alias.clone(), u.path.clone()));
                     }
-                    self.enums.insert(
-                        e.name.clone(),
-                        ir::EnumDef {
-                            name: e.name.clone(),
-                            variants: vec![],
-                        },
-                    );
                 }
-                _ => {}
             }
         }
+    }
 
-        // Now resolve field/variant/payload types (all type names are known).
-        for item in &program.items {
+    fn register_named(&mut self, name: &str, kind: ItemKind, cur: &[String], span: Span) {
+        let f = fqn(cur, name);
+        if self.kinds.contains_key(&f) {
+            self.diags.push(Diagnostic::new(
+                Stage::Type,
+                format!("duplicate definition `{}`", f),
+                span,
+            ));
+            return;
+        }
+        self.kinds.insert(f.clone(), kind);
+        match kind {
+            ItemKind::Struct => {
+                self.structs.insert(
+                    f.clone(),
+                    ir::StructDef {
+                        name: f,
+                        fields: vec![],
+                    },
+                );
+            }
+            ItemKind::Enum => {
+                self.enums.insert(
+                    f.clone(),
+                    ir::EnumDef {
+                        name: f,
+                        variants: vec![],
+                    },
+                );
+            }
+            ItemKind::Func => {}
+        }
+    }
+
+    /// Pass 2: resolve struct fields, enum payloads, and function signatures now
+    /// that every item name is known.
+    fn resolve_defs(&mut self, items: &[ast::Item], cur: &[String]) {
+        for item in items {
             match item {
                 ast::Item::Struct(s) => {
+                    let f = fqn(cur, &s.name);
                     let mut fields = Vec::new();
                     let mut seen = std::collections::HashSet::new();
-                    for f in &s.fields {
-                        if !seen.insert(f.name.clone()) {
+                    for fd in &s.fields {
+                        if !seen.insert(fd.name.clone()) {
                             self.diags.push(Diagnostic::new(
                                 Stage::Type,
-                                format!("duplicate field `{}` in struct `{}`", f.name, s.name),
-                                f.span,
+                                format!("duplicate field `{}` in struct `{}`", fd.name, f),
+                                fd.span,
                             ));
                         }
-                        match self.resolve(&f.ty, f.span) {
+                        match self.resolve_ty(&fd.ty, cur, fd.span) {
                             Ok(ty) => fields.push(ir::Field {
-                                name: f.name.clone(),
+                                name: fd.name.clone(),
                                 ty,
                             }),
                             Err(d) => self.diags.push(d),
                         }
                     }
-                    if let Some(sd) = self.structs.get_mut(&s.name) {
+                    if let Some(sd) = self.structs.get_mut(&f) {
                         sd.fields = fields;
                     }
                 }
                 ast::Item::Enum(e) => {
+                    let f = fqn(cur, &e.name);
                     let mut variants = Vec::new();
-                    for (tag, v) in e.variants.iter().enumerate() {
-                        if let Some((prev, _)) =
-                            self.variants.insert(v.name.clone(), (e.name.clone(), tag))
-                        {
+                    let mut seen = std::collections::HashSet::new();
+                    for v in &e.variants {
+                        if !seen.insert(v.name.clone()) {
                             self.diags.push(Diagnostic::new(
                                 Stage::Type,
-                                format!(
-                                    "variant name `{}` already used (in enum `{}`); \
-                                     variant names must be unique",
-                                    v.name, prev
-                                ),
+                                format!("duplicate variant `{}` in enum `{}`", v.name, f),
                                 v.span,
                             ));
                         }
                         let mut tys = Vec::new();
                         for t in &v.fields {
-                            match self.resolve(t, v.span) {
+                            match self.resolve_ty(t, cur, v.span) {
                                 Ok(ty) => tys.push(ty),
                                 Err(d) => self.diags.push(d),
                             }
@@ -213,41 +231,167 @@ impl Checker {
                             fields: tys,
                         });
                     }
-                    if let Some(ed) = self.enums.get_mut(&e.name) {
+                    if let Some(ed) = self.enums.get_mut(&f) {
                         ed.variants = variants;
+                    }
+                }
+                ast::Item::Func(fdef) => {
+                    let f = fqn(cur, &fdef.name);
+                    let params: Vec<Type> = fdef
+                        .params
+                        .iter()
+                        .filter_map(|p| self.resolve_ty(&p.ty, cur, p.span).ok())
+                        .collect();
+                    let ret = match &fdef.ret {
+                        Some(t) => self.resolve_ty(t, cur, fdef.span).unwrap_or(Type::Unit),
+                        None => Type::Unit,
+                    };
+                    self.funcs.insert(f, ir::Signature { params, ret });
+                }
+                ast::Item::Mod(m) => {
+                    if let Some(inner) = &m.items {
+                        let mut child = cur.to_vec();
+                        child.push(m.name.clone());
+                        self.resolve_defs(inner, &child);
+                    }
+                }
+                ast::Item::Use(_) => {}
+            }
+        }
+    }
+
+    /// Pass 3: typecheck function bodies, producing IR keyed by fully-qualified
+    /// name.
+    fn check_bodies(&mut self, items: &[ast::Item], cur: &[String], module: &mut ir::Module) {
+        for item in items {
+            match item {
+                ast::Item::Func(fdef) => {
+                    self.cur_mod = cur.to_vec();
+                    match self.check_func(fdef, cur) {
+                        Ok(func) => {
+                            module.funcs.insert(func.name.clone(), func);
+                        }
+                        Err(d) => self.diags.push(d),
+                    }
+                }
+                ast::Item::Mod(m) => {
+                    if let Some(inner) = &m.items {
+                        let mut child = cur.to_vec();
+                        child.push(m.name.clone());
+                        self.check_bodies(inner, &child, module);
                     }
                 }
                 _ => {}
             }
         }
+    }
 
-        // Function signatures.
-        for item in &program.items {
-            if let ast::Item::Func(f) = item {
-                if self.funcs.contains_key(&f.name) {
-                    self.diags.push(Diagnostic::new(
-                        Stage::Type,
-                        format!("duplicate function `{}`", f.name),
-                        f.span,
-                    ));
-                    continue;
-                }
-                let params: Vec<Type> = f
-                    .params
-                    .iter()
-                    .filter_map(|p| self.resolve(&p.ty, p.span).ok())
-                    .collect();
-                let ret = match &f.ret {
-                    Some(t) => self.resolve(t, f.span).unwrap_or(Type::Unit),
-                    None => Type::Unit,
-                };
-                self.funcs
-                    .insert(f.name.clone(), ir::Signature { params, ret });
+    // ---- name resolution ------------------------------------------------
+
+    /// Resolve a (possibly module-qualified) item path from module `cur`.
+    fn resolve_item(&self, cur: &[String], path: &[String]) -> Option<(String, ItemKind)> {
+        if path.is_empty() {
+            return None;
+        }
+        // 1. Lexical: try the path relative to `cur` and each ancestor module.
+        for k in (0..=cur.len()).rev() {
+            let mut segs = cur[..k].to_vec();
+            segs.extend_from_slice(path);
+            let key = segs.join("::");
+            if let Some(kind) = self.kinds.get(&key) {
+                return Some((key, *kind));
             }
+        }
+        // 2. `use` aliases visible in `cur` (or an ancestor module).
+        for k in (0..=cur.len()).rev() {
+            let modk = cur[..k].join("::");
+            if let Some(list) = self.uses.get(&modk) {
+                if let Some((_, target)) = list.iter().find(|(a, _)| a == &path[0]) {
+                    let mut segs = target.clone();
+                    segs.extend_from_slice(&path[1..]);
+                    let key = segs.join("::");
+                    if let Some(kind) = self.kinds.get(&key) {
+                        return Some((key, *kind));
+                    }
+                }
+            }
+        }
+        // 3. Glob imports (single-segment names only).
+        if path.len() == 1 {
+            for k in (0..=cur.len()).rev() {
+                let modk = cur[..k].join("::");
+                if let Some(list) = self.globs.get(&modk) {
+                    for g in list {
+                        let mut segs = g.clone();
+                        segs.push(path[0].clone());
+                        let key = segs.join("::");
+                        if let Some(kind) = self.kinds.get(&key) {
+                            return Some((key, *kind));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve an enum variant reference (qualified `Enum::Variant` or bare
+    /// `Variant`) to `(enum fqn, tag)`.
+    fn resolve_variant(&self, cur: &[String], path: &[String]) -> Option<(String, usize)> {
+        if path.len() >= 2 {
+            let (enum_path, last) = path.split_at(path.len() - 1);
+            if let Some((efqn, ItemKind::Enum)) = self.resolve_item(cur, enum_path) {
+                if let Some(tag) = self.enums[&efqn].variant_tag(&last[0]) {
+                    return Some((efqn, tag));
+                }
+            }
+            return None;
+        }
+        // Bare variant: find the unique in-scope enum that declares it.
+        let v = &path[0];
+        let mut hit: Option<(String, usize)> = None;
+        let mut count = 0;
+        for (efqn, ed) in &self.enums {
+            if let Some(tag) = ed.variant_tag(v) {
+                if self.enum_in_scope(cur, efqn) {
+                    hit = Some((efqn.clone(), tag));
+                    count += 1;
+                }
+            }
+        }
+        if count == 1 {
+            hit
+        } else {
+            None
         }
     }
 
-    fn resolve(&self, t: &ast::TypeExpr, span: Span) -> Result<Type, Diagnostic> {
+    /// Is enum `efqn` reachable by its simple name from module `cur` (directly,
+    /// or via a glob import of its module)?
+    fn enum_in_scope(&self, cur: &[String], efqn: &str) -> bool {
+        let simple = efqn.rsplit("::").next().unwrap().to_string();
+        if let Some((f, ItemKind::Enum)) = self.resolve_item(cur, &[simple]) {
+            if f == efqn {
+                return true;
+            }
+        }
+        let parent: Vec<String> = {
+            let mut segs: Vec<String> = efqn.split("::").map(|s| s.to_string()).collect();
+            segs.pop();
+            segs
+        };
+        for k in (0..=cur.len()).rev() {
+            let modk = cur[..k].join("::");
+            if let Some(list) = self.globs.get(&modk) {
+                if list.iter().any(|g| g == &parent) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_ty(&self, t: &ast::TypeExpr, cur: &[String], span: Span) -> Result<Type, Diagnostic> {
         Ok(match t {
             ast::TypeExpr::Bool => Type::Bool,
             ast::TypeExpr::Unit => Type::Unit,
@@ -257,31 +401,36 @@ impl Checker {
             }),
             ast::TypeExpr::Bit { width } => Type::Bit(*width),
             ast::TypeExpr::Array { elem, len } => {
-                Type::Array(Box::new(self.resolve(elem, span)?), *len)
+                Type::Array(Box::new(self.resolve_ty(elem, cur, span)?), *len)
             }
-            ast::TypeExpr::Named(name) => {
-                if self.structs.contains_key(name) {
-                    Type::Struct(name.clone())
-                } else if self.enums.contains_key(name) {
-                    Type::Enum(name.clone())
-                } else {
+            ast::TypeExpr::Named(path) => match self.resolve_item(cur, path) {
+                Some((f, ItemKind::Struct)) => Type::Struct(f),
+                Some((f, ItemKind::Enum)) => Type::Enum(f),
+                Some((f, ItemKind::Func)) => {
                     return Err(Diagnostic::new(
                         Stage::Type,
-                        format!("unknown type `{}`", name),
+                        format!("`{}` is a function, not a type", f),
                         span,
-                    ));
+                    ))
                 }
-            }
+                None => {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        format!("unknown type `{}`", path.join("::")),
+                        span,
+                    ))
+                }
+            },
         })
     }
 
     // ---- functions ------------------------------------------------------
 
-    fn check_func(&mut self, f: &ast::Func) -> Result<ir::Func, Diagnostic> {
+    fn check_func(&mut self, f: &ast::Func, cur: &[String]) -> Result<ir::Func, Diagnostic> {
         let mut params = Vec::new();
         self.scopes = vec![HashMap::new()];
         for p in &f.params {
-            let ty = self.resolve(&p.ty, p.span)?;
+            let ty = self.resolve_ty(&p.ty, cur, p.span)?;
             self.bind(&p.name, ty.clone(), false);
             params.push(ir::Param {
                 name: p.name.clone(),
@@ -289,7 +438,7 @@ impl Checker {
             });
         }
         let ret = match &f.ret {
-            Some(t) => self.resolve(t, f.span)?,
+            Some(t) => self.resolve_ty(t, cur, f.span)?,
             None => Type::Unit,
         };
         self.cur_ret = ret.clone();
@@ -306,7 +455,7 @@ impl Checker {
             ));
         }
         Ok(ir::Func {
-            name: f.name.clone(),
+            name: fqn(cur, &f.name),
             params,
             ret,
             body,
@@ -370,7 +519,10 @@ impl Checker {
                 span,
             } => {
                 let expected = match ty {
-                    Some(t) => Some(self.resolve(t, *span)?),
+                    Some(t) => {
+                        let cur = self.cur_mod.clone();
+                        Some(self.resolve_ty(t, &cur, *span)?)
+                    }
                     None => None,
                 };
                 let init_ir = self.check_expr(init, expected.as_ref())?;
@@ -610,6 +762,7 @@ impl Checker {
                 Ok(ir::Expr::new(ir::ExprKind::Bool(*value), Type::Bool))
             }
             ast::Expr::Ident { name, span } => self.check_ident(name, *span),
+            ast::Expr::Path { segments, span } => self.check_path(segments, *span),
             ast::Expr::Unary { op, expr, span } => self.check_unary(*op, expr, *span, expected),
             ast::Expr::Binary { op, lhs, rhs, .. } => self.check_binary(*op, lhs, rhs, expected),
             ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
@@ -653,8 +806,8 @@ impl Checker {
                 ))
             }
             ast::Expr::Array { elems, span } => self.check_array(elems, *span, expected),
-            ast::Expr::StructLit { name, fields, span } => {
-                self.check_struct_lit(name, fields, *span)
+            ast::Expr::StructLit { path, fields, span } => {
+                self.check_struct_lit(path, fields, *span)
             }
             ast::Expr::If {
                 cond,
@@ -680,17 +833,28 @@ impl Checker {
                 local.ty.clone(),
             ));
         }
-        // A unit-like enum variant referenced by name.
-        if let Some((enum_name, tag)) = self.variants.get(name).cloned() {
+        self.check_unit_variant(&[name.to_string()], span)
+    }
+
+    /// A path used as a value: must be a unit-like enum variant (there are no
+    /// module-level constants in v1).
+    fn check_path(&mut self, segments: &[String], span: Span) -> Result<ir::Expr, Diagnostic> {
+        self.check_unit_variant(segments, span)
+    }
+
+    fn check_unit_variant(&mut self, path: &[String], span: Span) -> Result<ir::Expr, Diagnostic> {
+        let cur = self.cur_mod.clone();
+        if let Some((enum_name, tag)) = self.resolve_variant(&cur, path) {
             let variant = &self.enums[&enum_name].variants[tag];
             if !variant.fields.is_empty() {
+                let shown = path.join("::");
                 return Err(Diagnostic::new(
                     Stage::Type,
                     format!(
                         "variant `{}` takes {} argument(s); call it like `{}(...)`",
-                        name,
+                        shown,
                         variant.fields.len(),
-                        name
+                        shown
                     ),
                     span,
                 ));
@@ -706,7 +870,7 @@ impl Checker {
         }
         Err(Diagnostic::new(
             Stage::Type,
-            format!("unknown identifier `{}`", name),
+            format!("unknown identifier `{}`", path.join("::")),
             span,
         ))
     }
@@ -892,8 +1056,9 @@ impl Checker {
         args: &[ast::Expr],
         span: Span,
     ) -> Result<ir::Expr, Diagnostic> {
-        let name = match callee {
-            ast::Expr::Ident { name, .. } => name.clone(),
+        let path: Vec<String> = match callee {
+            ast::Expr::Ident { name, .. } => vec![name.clone()],
+            ast::Expr::Path { segments, .. } => segments.clone(),
             other => {
                 return Err(Diagnostic::new(
                     Stage::Type,
@@ -902,9 +1067,11 @@ impl Checker {
                 ))
             }
         };
+        let shown = path.join("::");
+        let cur = self.cur_mod.clone();
 
         // Built-in `print`.
-        if name == "print" {
+        if path == ["print"] {
             if args.len() != 1 {
                 return Err(Diagnostic::new(
                     Stage::Type,
@@ -927,14 +1094,14 @@ impl Checker {
         }
 
         // Enum variant constructor.
-        if let Some((enum_name, tag)) = self.variants.get(&name).cloned() {
+        if let Some((enum_name, tag)) = self.resolve_variant(&cur, &path) {
             let field_tys = self.enums[&enum_name].variants[tag].fields.clone();
             if args.len() != field_tys.len() {
                 return Err(Diagnostic::new(
                     Stage::Type,
                     format!(
                         "variant `{}` takes {} argument(s), found {}",
-                        name,
+                        shown,
                         field_tys.len(),
                         args.len()
                     ),
@@ -964,15 +1131,29 @@ impl Checker {
         }
 
         // Ordinary function call.
-        let sig = self.funcs.get(&name).cloned().ok_or_else(|| {
-            Diagnostic::new(Stage::Type, format!("unknown function `{}`", name), span)
-        })?;
+        let (ffqn, sig) = match self.resolve_item(&cur, &path) {
+            Some((f, ItemKind::Func)) => (f.clone(), self.funcs[&f].clone()),
+            Some((f, _)) => {
+                return Err(Diagnostic::new(
+                    Stage::Type,
+                    format!("`{}` is not a function", f),
+                    span,
+                ))
+            }
+            None => {
+                return Err(Diagnostic::new(
+                    Stage::Type,
+                    format!("unknown function `{}`", shown),
+                    span,
+                ))
+            }
+        };
         if args.len() != sig.params.len() {
             return Err(Diagnostic::new(
                 Stage::Type,
                 format!(
                     "function `{}` takes {} argument(s), found {}",
-                    name,
+                    shown,
                     sig.params.len(),
                     args.len()
                 ),
@@ -993,7 +1174,7 @@ impl Checker {
         }
         Ok(ir::Expr::new(
             ir::ExprKind::Call {
-                func: name,
+                func: ffqn,
                 args: arg_irs,
             },
             sig.ret,
@@ -1050,10 +1231,22 @@ impl Checker {
 
     fn check_struct_lit(
         &mut self,
-        name: &str,
+        path: &[String],
         fields: &[(String, ast::Expr)],
         span: Span,
     ) -> Result<ir::Expr, Diagnostic> {
+        let cur = self.cur_mod.clone();
+        let name = match self.resolve_item(&cur, path) {
+            Some((f, ItemKind::Struct)) => f,
+            _ => {
+                return Err(Diagnostic::new(
+                    Stage::Type,
+                    format!("unknown struct `{}`", path.join("::")),
+                    span,
+                ))
+            }
+        };
+        let name = name.as_str();
         let sd = self
             .structs
             .get(name)
@@ -1289,27 +1482,29 @@ impl Checker {
                 Ok(ir::Pattern::Bool(*value))
             }
             ast::Pattern::Variant {
-                name,
+                path,
                 subpatterns,
                 span,
             } => {
+                let shown = path.join("::");
                 let enum_name = match ty {
                     Type::Enum(n) => n.clone(),
                     other => {
                         return Err(Diagnostic::new(
                             Stage::Type,
-                            format!("variant pattern `{}` cannot match type `{}`", name, other),
+                            format!("variant pattern `{}` cannot match type `{}`", shown, other),
                             *span,
                         ))
                     }
                 };
-                let (ven, tag) = self.variants.get(name).cloned().ok_or_else(|| {
-                    Diagnostic::new(Stage::Type, format!("unknown variant `{}`", name), *span)
+                let cur = self.cur_mod.clone();
+                let (ven, tag) = self.resolve_variant(&cur, path).ok_or_else(|| {
+                    Diagnostic::new(Stage::Type, format!("unknown variant `{}`", shown), *span)
                 })?;
                 if ven != enum_name {
                     return Err(Diagnostic::new(
                         Stage::Type,
-                        format!("variant `{}` belongs to enum `{}`, not `{}`", name, ven, enum_name),
+                        format!("variant `{}` belongs to enum `{}`, not `{}`", shown, ven, enum_name),
                         *span,
                     ));
                 }
@@ -1319,7 +1514,7 @@ impl Checker {
                         Stage::Type,
                         format!(
                             "variant `{}` has {} field(s) but pattern binds {}",
-                            name,
+                            shown,
                             field_tys.len(),
                             subpatterns.len()
                         ),
@@ -1364,16 +1559,17 @@ impl Checker {
             Type::Enum(name) => {
                 let ed = &self.enums[name];
                 let mut covered = vec![false; ed.variants.len()];
+                let cur = self.cur_mod.clone();
                 for a in arms {
                     if let ast::Pattern::Variant {
-                        name: vname,
-                        subpatterns,
-                        ..
+                        path, subpatterns, ..
                     } = &a.pattern
                     {
                         if subpatterns.iter().all(is_irrefutable) {
-                            if let Some(tag) = ed.variant_tag(vname) {
-                                covered[tag] = true;
+                            if let Some((efqn, tag)) = self.resolve_variant(&cur, path) {
+                                if efqn == *name {
+                                    covered[tag] = true;
+                                }
                             }
                         }
                     }
@@ -1452,6 +1648,16 @@ impl Checker {
             format!("operator `{:?}` is not defined for type `{}`", op, ty),
             span,
         )
+    }
+}
+
+/// Join a module path and a simple name into a fully-qualified name. At the
+/// program root (`cur` empty) this is just the bare name.
+fn fqn(cur: &[String], name: &str) -> String {
+    if cur.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{}", cur.join("::"), name)
     }
 }
 
@@ -1547,6 +1753,76 @@ mod tests {
 
     fn err_msg(src: &str) -> String {
         ck(src).unwrap_err().remove(0).message
+    }
+
+    #[test]
+    fn modules_qualify_names() {
+        let src = r#"
+            mod math {
+                fn square(x: u32) -> u32 { x * x }
+            }
+            mod geom {
+                struct Point { x: u32, y: u32 }
+                enum Shape { Circle(u32), Rect(u32, u32) }
+                fn area(s: Shape) -> u32 {
+                    match s { Circle(r) => 3 * r * r, Rect(w, h) => w * h }
+                }
+            }
+            fn main() {
+                print(math::square(7));
+                let p: geom::Point = geom::Point { x: 1, y: 2 };
+                print(p.x + p.y);
+                print(geom::area(geom::Shape::Rect(3, 4)));
+            }
+        "#;
+        let m = ck(src).unwrap();
+        // Items are keyed by fully-qualified name.
+        assert!(m.funcs.contains_key("math::square"));
+        assert!(m.funcs.contains_key("geom::area"));
+        assert!(m.structs.contains_key("geom::Point"));
+        assert!(m.enums.contains_key("geom::Shape"));
+        assert!(m.funcs.contains_key("main"));
+    }
+
+    #[test]
+    fn use_import_brings_name_into_scope() {
+        let src = r#"
+            mod math { fn dbl(x: u32) -> u32 { x + x } }
+            use math::dbl;
+            fn main() { print(dbl(21)); }
+        "#;
+        assert!(ck(src).is_ok());
+    }
+
+    #[test]
+    fn glob_import_and_in_module_variant() {
+        let src = r#"
+            mod shapes {
+                enum Shape { A, B }
+                fn name(s: Shape) -> u8 { match s { A => 0, B => 1 } }
+            }
+            use shapes::*;
+            fn pick() -> Shape { Shape::A }
+            fn main() { print(shapes::name(pick())); }
+        "#;
+        assert!(ck(src).is_ok(), "{:?}", ck(src).err());
+    }
+
+    #[test]
+    fn unknown_qualified_name_errors() {
+        let msg = err_msg("mod m { fn f() -> u8 { 0 } } fn main() { print(m::g()); }");
+        assert!(msg.contains("unknown function") && msg.contains("m::g"), "{}", msg);
+    }
+
+    #[test]
+    fn sibling_modules_can_have_same_variant_name() {
+        // Variant names need only be unique per enum now, not globally.
+        let src = r#"
+            mod a { enum E { Dot } fn f() -> E { E::Dot } }
+            mod b { enum E { Dot } fn g() -> E { E::Dot } }
+            fn main() { }
+        "#;
+        assert!(ck(src).is_ok(), "{:?}", ck(src).err());
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub enum Tok {
     In,
     Match,
     Return,
+    Mod,
+    Use,
     True,
     False,
     Bool,
@@ -45,6 +47,7 @@ pub enum Tok {
     Comma,
     Semi,
     Colon,
+    ColonColon, // ::
     Dot,
     DotDot,
     Arrow,    // ->
@@ -224,6 +227,8 @@ fn keyword_or_ident(word: &str) -> Tok {
         "in" => Tok::In,
         "match" => Tok::Match,
         "return" => Tok::Return,
+        "mod" => Tok::Mod,
+        "use" => Tok::Use,
         "true" => Tok::True,
         "false" => Tok::False,
         "bool" => Tok::Bool,
@@ -258,6 +263,7 @@ fn match_operator(b: &[u8]) -> Option<(Tok, usize)> {
             b"<<" => Some(Tok::Shl),
             b">>" => Some(Tok::Shr),
             b".." => Some(Tok::DotDot),
+            b"::" => Some(Tok::ColonColon),
             _ => None,
         };
         if let Some(t) = t {

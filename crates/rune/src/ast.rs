@@ -18,12 +18,40 @@ pub struct Program {
     pub items: Vec<Item>,
 }
 
-/// A top-level declaration.
+/// A top-level (or in-module) declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Func(Func),
     Struct(StructDef),
     Enum(EnumDef),
+    /// A module: a named namespace of items. Inline (`mod m { ... }`) carries
+    /// `Some(items)`; a file module declaration (`mod m;`) carries `None` and is
+    /// resolved to a sibling file by the module loader before typechecking.
+    Mod(ModDef),
+    /// A `use path::to::item;` (or `use path::*;`) import.
+    Use(UseDecl),
+}
+
+/// A dotted/`::`-separated name path, e.g. `math::clamp` → `["math", "clamp"]`.
+pub type Path = Vec<String>;
+
+/// A module declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModDef {
+    pub name: String,
+    /// `Some` for inline modules; `None` for `mod name;` file declarations.
+    pub items: Option<Vec<Item>>,
+    pub span: Span,
+}
+
+/// A `use` import: brings a path's item (or, with `glob`, all of a module's
+/// items) into the current module's scope under their simple names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UseDecl {
+    pub path: Path,
+    /// `true` for `use path::*;`.
+    pub glob: bool,
+    pub span: Span,
 }
 
 /// A function definition: `fn name(params) -> ret { body }`.
@@ -93,8 +121,9 @@ pub enum TypeExpr {
     Bit { width: u32 },
     /// `[T; N]` — fixed-size array.
     Array { elem: Box<TypeExpr>, len: u64 },
-    /// A named type (resolved later to a struct or enum).
-    Named(String),
+    /// A named type, possibly module-qualified (resolved later to a struct or
+    /// enum), e.g. `Shape` or `geom::Point`.
+    Named(Path),
     /// The unit type, written `()`.
     Unit,
 }
@@ -144,8 +173,11 @@ pub enum Expr {
     Int { value: i128, span: Span },
     /// Boolean literal.
     Bool { value: bool, span: Span },
-    /// A variable, function name, or unit-like enum variant reference.
+    /// A bare name: a local variable, function, or unit-like enum variant.
     Ident { name: String, span: Span },
+    /// A module-qualified path used as a value, e.g. `math::PI` or a unit-like
+    /// variant `Shape::Dot`. Always has 2+ segments (single names are `Ident`).
+    Path { segments: Path, span: Span },
     /// Unary operation.
     Unary { op: UnOp, expr: Box<Expr>, span: Span },
     /// Binary operation.
@@ -176,9 +208,9 @@ pub enum Expr {
     },
     /// Array literal `[a, b, c]`.
     Array { elems: Vec<Expr>, span: Span },
-    /// Struct literal `Name { field: expr, ... }`.
+    /// Struct literal `Name { field: expr, ... }` (name may be path-qualified).
     StructLit {
-        name: String,
+        path: Path,
         fields: Vec<(String, Expr)>,
         span: Span,
     },
@@ -226,9 +258,10 @@ pub enum Pattern {
     Int { value: i128, span: Span },
     /// A boolean literal pattern.
     Bool { value: bool, span: Span },
-    /// An enum variant pattern `Variant(sub, ...)` (or `Variant` for unit-like).
+    /// An enum variant pattern `Variant(sub, ...)` (or `Variant` for unit-like),
+    /// where the variant may be path-qualified, e.g. `Shape::Rect(w, h)`.
     Variant {
-        name: String,
+        path: Path,
         subpatterns: Vec<Pattern>,
         span: Span,
     },
@@ -241,6 +274,7 @@ impl Expr {
             Expr::Int { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Ident { span, .. }
+            | Expr::Path { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }

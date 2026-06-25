@@ -57,22 +57,28 @@ fn usage_error(msg: &str) -> ExitCode {
 // ---- run ----------------------------------------------------------------
 
 fn run_file(path: &str) -> ExitCode {
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read `{}`: {}", path, e);
+    // Use the module loader so multi-file projects (`mod name;`) work. The entry
+    // file's own source is used to render diagnostics with carets.
+    let src = std::fs::read_to_string(path).unwrap_or_default();
+    let module = match rune::compile_path(std::path::Path::new(path)) {
+        Ok(m) => m,
+        Err(diags) => {
+            for d in &diags {
+                eprintln!("{}\n", d.render(&src));
+            }
             return ExitCode::FAILURE;
         }
     };
-    match run_source(&src) {
+    let mut interp = rune::Interpreter::new(module);
+    match interp.run_main() {
         Ok(lines) => {
             for line in lines {
                 println!("{}", line);
             }
             ExitCode::SUCCESS
         }
-        Err(rendered) => {
-            eprintln!("{}", rendered);
+        Err(d) => {
+            eprintln!("{}", d.render(&src));
             ExitCode::FAILURE
         }
     }

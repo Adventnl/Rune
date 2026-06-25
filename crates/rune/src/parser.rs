@@ -98,11 +98,72 @@ impl<'a> Parser<'a> {
             Tok::Fn => self.func().map(Item::Func),
             Tok::Struct => self.struct_def().map(Item::Struct),
             Tok::Enum => self.enum_def().map(Item::Enum),
+            Tok::Mod => self.mod_def().map(Item::Mod),
+            Tok::Use => self.use_decl().map(Item::Use),
             other => Err(self.err(format!(
-                "expected an item (fn, struct, or enum), found {}",
+                "expected an item (fn, struct, enum, mod, or use), found {}",
                 describe(other)
             ))),
         }
+    }
+
+    fn mod_def(&mut self) -> PResult<ModDef> {
+        let start = self.span();
+        self.expect(&Tok::Mod, "`mod`")?;
+        let (name, _) = self.ident()?;
+        if self.eat(&Tok::Semi) {
+            // File module: `mod name;` resolved to a sibling file by the loader.
+            return Ok(ModDef {
+                name,
+                items: None,
+                span: start.merge(self.prev_span()),
+            });
+        }
+        self.expect(&Tok::LBrace, "`{` or `;` after module name")?;
+        let mut items = Vec::new();
+        while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+            items.push(self.item()?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(ModDef {
+            name,
+            items: Some(items),
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    fn use_decl(&mut self) -> PResult<UseDecl> {
+        let start = self.span();
+        self.expect(&Tok::Use, "`use`")?;
+        let (first, _) = self.ident()?;
+        let mut path = vec![first];
+        let mut glob = false;
+        while self.eat(&Tok::ColonColon) {
+            if self.eat(&Tok::Star) {
+                glob = true;
+                break;
+            }
+            let (seg, _) = self.ident()?;
+            path.push(seg);
+        }
+        self.expect(&Tok::Semi, "`;` after use")?;
+        Ok(UseDecl {
+            path,
+            glob,
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    /// Parse a `::`-separated path starting at the current identifier:
+    /// `a` → `["a"]`, `a::b::c` → `["a","b","c"]`.
+    fn name_path(&mut self) -> PResult<Path> {
+        let (first, _) = self.ident()?;
+        let mut segs = vec![first];
+        while self.eat(&Tok::ColonColon) {
+            let (seg, _) = self.ident()?;
+            segs.push(seg);
+        }
+        Ok(segs)
     }
 
     fn func(&mut self) -> PResult<Func> {
@@ -257,9 +318,9 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen, "`)` (unit type)")?;
                 Ok(TypeExpr::Unit)
             }
-            Tok::Ident(name) => {
-                self.bump();
-                Ok(TypeExpr::Named(name))
+            Tok::Ident(_) => {
+                let segs = self.name_path()?;
+                Ok(TypeExpr::Named(segs))
             }
             other => Err(self.err(format!("expected a type, found {}", describe(&other)))),
         }
@@ -552,18 +613,27 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Expr::Bool { value: false, span })
             }
-            Tok::Ident(name) => {
-                self.bump();
+            Tok::Ident(_) => {
+                let segs = self.name_path()?;
+                let span = span.merge(self.prev_span());
                 // Struct literal `Name { field: expr, ... }` — only when allowed
-                // and the name looks like a type (starts uppercase) to avoid
-                // ambiguity with a following block.
-                if allow_struct
-                    && self.at(&Tok::LBrace)
-                    && name.chars().next().map_or(false, |c| c.is_uppercase())
-                {
-                    return self.struct_lit(name, span);
+                // and the final segment looks like a type (starts uppercase) to
+                // avoid ambiguity with a following block.
+                let last_upper = segs
+                    .last()
+                    .and_then(|s| s.chars().next())
+                    .map_or(false, |c| c.is_uppercase());
+                if allow_struct && self.at(&Tok::LBrace) && last_upper {
+                    return self.struct_lit(segs, span);
                 }
-                Ok(Expr::Ident { name, span })
+                if segs.len() == 1 {
+                    Ok(Expr::Ident {
+                        name: segs.into_iter().next().unwrap(),
+                        span,
+                    })
+                } else {
+                    Ok(Expr::Path { segments: segs, span })
+                }
             }
             Tok::LParen => {
                 self.bump();
@@ -604,7 +674,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn struct_lit(&mut self, name: String, start: Span) -> PResult<Expr> {
+    fn struct_lit(&mut self, path: Path, start: Span) -> PResult<Expr> {
         self.expect(&Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.at(&Tok::RBrace) {
@@ -618,7 +688,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(Expr::StructLit {
-            name,
+            path,
             fields,
             span: start.merge(self.prev_span()),
         })
@@ -681,11 +751,15 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Pattern::Wildcard { span })
             }
-            Tok::Ident(name) => {
-                self.bump();
-                // Variant pattern if uppercase or followed by `(`.
-                let is_variant = self.at(&Tok::LParen)
-                    || name.chars().next().map_or(false, |c| c.is_uppercase());
+            Tok::Ident(_) => {
+                let segs = self.name_path()?;
+                // Variant pattern if path-qualified, uppercase, or followed by `(`;
+                // otherwise a simple lowercase name is a binding.
+                let last_upper = segs
+                    .last()
+                    .and_then(|s| s.chars().next())
+                    .map_or(false, |c| c.is_uppercase());
+                let is_variant = self.at(&Tok::LParen) || segs.len() > 1 || last_upper;
                 if is_variant {
                     let mut subpatterns = Vec::new();
                     if self.eat(&Tok::LParen) {
@@ -698,12 +772,15 @@ impl<'a> Parser<'a> {
                         self.expect(&Tok::RParen, "`)`")?;
                     }
                     Ok(Pattern::Variant {
-                        name,
+                        path: segs,
                         subpatterns,
                         span: span.merge(self.prev_span()),
                     })
                 } else {
-                    Ok(Pattern::Binding { name, span })
+                    Ok(Pattern::Binding {
+                        name: segs.into_iter().next().unwrap(),
+                        span,
+                    })
                 }
             }
             Tok::True => {
