@@ -30,6 +30,7 @@ pub mod interp;
 
 pub mod hdl;
 pub mod hotreload;
+pub mod verilog;
 
 pub use diagnostic::{Diagnostic, Stage};
 pub use interp::{Interpreter, Value};

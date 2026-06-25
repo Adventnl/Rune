@@ -41,6 +41,10 @@ fn main() -> ExitCode {
             Some(path) => hdl_file(path),
             None => usage_error("usage: runec hdl <file.rune>"),
         },
+        Some("verilog") => match args.get(2) {
+            Some(path) => verilog_file(path),
+            None => usage_error("usage: runec verilog <file.rune>"),
+        },
         Some("repl") | None => repl_loop(),
         Some("help") | Some("--help") | Some("-h") => {
             print!("{}", top_usage());
@@ -305,6 +309,26 @@ fn hdl_file(path: &str) -> ExitCode {
     };
     let reports = rune::hdl::analyze(&module);
     println!("{}", rune::hdl::report_string(&reports).trim_end());
+    ExitCode::SUCCESS
+}
+
+// ---- verilog ------------------------------------------------------------
+
+/// Compile a file and print synthesizable Verilog for its synthesizable
+/// functions (analysis-gated; non-qualifiers are emitted as `// skipped`
+/// comments). No hardware is run — this is codegen only.
+fn verilog_file(path: &str) -> ExitCode {
+    let src = std::fs::read_to_string(path).unwrap_or_default();
+    let module = match rune::compile_path(std::path::Path::new(path)) {
+        Ok(m) => m,
+        Err(diags) => {
+            for d in &diags {
+                eprintln!("{}\n", d.render(&src));
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", rune::verilog::emit(&module));
     ExitCode::SUCCESS
 }
 
