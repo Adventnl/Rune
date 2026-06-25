@@ -1,0 +1,37 @@
+// A small combinational ALU and bit helpers — all in the synthesizable subset
+// (pure, fixed-width bit<N>, no loops/recursion). Emit Verilog with:
+//
+//     runec verilog examples/alu.rune
+//
+// `main` itself is not synthesizable (it prints); the backend lowers `alu`,
+// `rotl8`, and `parity8` and skips `main` with a reason.
+
+fn alu(op: bit<2>, a: bit<8>, b: bit<8>) -> bit<8> {
+    match op {
+        0 => a + b,       // add (wraps mod 256)
+        1 => a - b,       // sub
+        2 => a & b,       // and
+        _ => a ^ b,       // xor
+    }
+}
+
+fn rotl8(x: bit<8>, n: bit<8>) -> bit<8> {
+    let m: bit<8> = n & 7;
+    (x << m) | (x >> ((8 - m) & 7))
+}
+
+fn parity8(x: bit<8>) -> bit<8> {
+    let a: bit<8> = x ^ (x >> 4);
+    let b: bit<8> = a ^ (a >> 2);
+    let c: bit<8> = b ^ (b >> 1);
+    c & 1
+}
+
+fn main() {
+    print(alu(0, 200, 100));  // 44  (add wraps)
+    print(alu(1, 10, 25));    // 241 (sub wraps)
+    print(alu(2, 0xF0, 0x3C));// 48
+    print(alu(3, 0xF0, 0x0F));// 255
+    print(rotl8(0x81, 1));    // 3
+    print(parity8(0x7));      // 1
+}

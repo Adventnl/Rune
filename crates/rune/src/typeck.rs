@@ -970,13 +970,16 @@ impl Checker {
             ));
         }
 
-        // Shifts: lhs determines result type; rhs is an independent integer.
+        // Shifts: lhs determines result type; the shift amount is an
+        // independent integer. A literal amount adopts the left operand's type
+        // (so `x >> 1` with `x: bit<8>` keeps the amount in `bit<8>` rather than
+        // defaulting to `i32`), which also keeps such code lowerable to hardware.
         if matches!(irop, ir::BinOp::Shl | ir::BinOp::Shr) {
             let l = self.check_expr(lhs, expected)?;
             if !l.ty.is_integer() {
                 return Err(self.op_type_err(op, &l.ty, lhs.span()));
             }
-            let r = self.check_expr(rhs, None)?;
+            let r = self.check_expr(rhs, Some(&l.ty))?;
             if !r.ty.is_integer() {
                 return Err(self.op_type_err(op, &r.ty, rhs.span()));
             }

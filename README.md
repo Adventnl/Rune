@@ -111,6 +111,25 @@ bare when the enum is in scope. Variant names need only be unique per enum.
 on `bit<32>`). There are no generics in v1, so these are monomorphic. The driver
 injects `std` automatically; override its location with the `RUNE_STD` env var.
 
+### Verilog backend
+
+`runec verilog <file>` lowers the **synthesizable subset** to synthesizable
+Verilog — the second intended target of the architecture. Codegen is gated by
+the same analysis pass: each qualifying function becomes a Verilog `module`
+(one `input` per parameter, an `output` named `out`); non-qualifiers are emitted
+as `// skipped` comments with reasons. **No hardware is generated for anything
+the analysis rejects.**
+
+```sh
+runec verilog examples/alu.rune    # emit modules for alu/rotl8/parity8, skip main
+```
+
+The output matches the interpreter **bit-for-bit**: every IR operation becomes
+its own sized `wire`, so `bit<N>` wrapping truncates at each step exactly as the
+interpreter does. Equivalence is verified by a reference netlist evaluator
+checked against the interpreter over many inputs, and — where `iverilog` is
+installed — by cosimulating a generated testbench. See `docs/verilog.md`.
+
 **Packages** are directories with a `rune.toml`:
 
 ```toml
