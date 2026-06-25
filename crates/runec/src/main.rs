@@ -3,14 +3,20 @@
 //! Argument parsing is done by hand (no external deps). Subcommands:
 //!
 //! - `runec run <file.rune>`   — compile and run `main()`.
+//! - `runec run [dir]`         — build the package in `dir` and run its `main()`.
 //! - `runec repl`              — start the interactive REPL (also the default
 //!                               when invoked with no arguments).
 //! - `runec watch <file.rune>` — run `main()`, then hot-reload on file edits.
+//! - `runec new <name>`        — scaffold a new package directory.
+//! - `runec build [dir]`       — resolve + typecheck a package (no codegen).
+//! - `runec test [dir]`        — build a package and run its `test_*` functions.
 
+mod pkg;
 mod repl;
 
 use repl::{Outcome, Session};
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -18,9 +24,15 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("run") => match args.get(2) {
-            Some(path) => run_file(path),
-            None => usage_error("usage: runec run <file.rune>"),
+            Some(path) => run_target(path),
+            None => usage_error("usage: runec run <file.rune | dir>"),
         },
+        Some("new") => match args.get(2) {
+            Some(name) => new_package(name),
+            None => usage_error("usage: runec new <name>"),
+        },
+        Some("build") => build_package(args.get(2).map(String::as_str).unwrap_or(".")),
+        Some("test") => test_package(args.get(2).map(String::as_str).unwrap_or(".")),
         Some("watch") => match args.get(2) {
             Some(path) => watch_file(path),
             None => usage_error("usage: runec watch <file.rune>"),
@@ -40,7 +52,10 @@ fn main() -> ExitCode {
 
 fn top_usage() -> String {
     format!(
-        "Rune {}\n\nusage:\n  runec run <file.rune>     compile and run main()\n  \
+        "Rune {}\n\nusage:\n  runec run <file.rune|dir>  run a file's or package's main()\n  \
+         runec new <name>          scaffold a new package directory\n  \
+         runec build [dir]         resolve + typecheck a package (default .)\n  \
+         runec test [dir]          build a package and run its test_* functions\n  \
          runec repl                start the interactive REPL\n  \
          runec watch <file.rune>   run main(), then hot-reload on edits\n  \
          runec hdl <file.rune>     report which functions are synthesizable\n\n\
@@ -82,6 +97,181 @@ fn run_file(path: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Dispatch `runec run <target>`: a `.rune` file runs as a single file (the
+/// existing behaviour); a directory — or anything containing a `rune.toml` — is
+/// treated as a package.
+fn run_target(target: &str) -> ExitCode {
+    let path = Path::new(target);
+    let is_package = path.is_dir() || path.join("rune.toml").is_file();
+    if is_package {
+        run_package(path)
+    } else {
+        run_file(target)
+    }
+}
+
+// ---- package commands ----------------------------------------------------
+
+/// Render package build diagnostics against the entry file's source (for carets
+/// on entry-file errors); dependency/std errors carry their message only.
+fn report_pkg_diags(dir: &Path, diags: &[rune::Diagnostic]) {
+    let entry_src = pkg::load_manifest(dir)
+        .ok()
+        .map(|m| dir.join(&m.entry))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    for d in diags {
+        eprintln!("{}\n", d.render(&entry_src));
+    }
+}
+
+/// `runec build [dir]` — resolve and typecheck a package.
+fn build_package(dir: &str) -> ExitCode {
+    let dir = Path::new(dir);
+    let manifest = match pkg::load_manifest(dir) {
+        Ok(m) => m,
+        Err(e) => return usage_error(&format!("error: {}", e)),
+    };
+    match pkg::build(dir) {
+        Ok(module) => {
+            println!(
+                "compiled {} v{} ({} functions)",
+                manifest.name,
+                manifest.version,
+                module.funcs.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(diags) => {
+            report_pkg_diags(dir, &diags);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `runec run <dir>` — build the package and run its `main()`.
+fn run_package(dir: &Path) -> ExitCode {
+    let module = match pkg::build(dir) {
+        Ok(m) => m,
+        Err(diags) => {
+            report_pkg_diags(dir, &diags);
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry_src = pkg::load_manifest(dir)
+        .ok()
+        .map(|m| dir.join(&m.entry))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let mut interp = rune::Interpreter::new(module);
+    match interp.run_main() {
+        Ok(lines) => {
+            for line in lines {
+                println!("{}", line);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(d) => {
+            eprintln!("{}", d.render(&entry_src));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `runec test [dir]` — build the package, then run every zero-argument
+/// function whose fully-qualified name's final segment starts with `test_` and
+/// which returns `bool`. A `false` return or a runtime trap is a failure.
+fn test_package(dir: &str) -> ExitCode {
+    let dir = Path::new(dir);
+    let module = match pkg::build(dir) {
+        Ok(m) => m,
+        Err(diags) => {
+            report_pkg_diags(dir, &diags);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Collect test functions: final path segment starts with `test_`, no params,
+    // returns bool. Deterministic order (funcs is a BTreeMap).
+    let tests: Vec<String> = module
+        .funcs
+        .values()
+        .filter(|f| {
+            let last = f.name.rsplit("::").next().unwrap_or(&f.name);
+            last.starts_with("test_")
+                && f.params.is_empty()
+                && f.ret == rune::ir::Type::Bool
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    if tests.is_empty() {
+        println!("no tests found");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut interp = rune::Interpreter::new(module);
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for name in &tests {
+        match interp.call(name, vec![]) {
+            Ok(rune::Value::Bool(true)) => {
+                println!("test {} ... ok", name);
+                passed += 1;
+            }
+            Ok(_) => {
+                println!("test {} ... FAILED (returned false)", name);
+                failed += 1;
+            }
+            Err(d) => {
+                println!("test {} ... FAILED ({})", name, d.message);
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "\ntest result: {}. {} passed; {} failed",
+        if failed == 0 { "ok" } else { "FAILED" },
+        passed,
+        failed
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `runec new <name>` — scaffold `./<name>/` with a manifest and a hello program.
+fn new_package(name: &str) -> ExitCode {
+    let dir = Path::new(name);
+    if dir.exists() {
+        return usage_error(&format!("error: `{}` already exists", dir.display()));
+    }
+    let src_dir = dir.join("src");
+    if let Err(e) = std::fs::create_dir_all(&src_dir) {
+        return usage_error(&format!("error: cannot create `{}`: {}", src_dir.display(), e));
+    }
+    // Use only the final path component for the package name in the manifest.
+    let pkg_name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    let manifest = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nentry = \"src/main.rune\"\n\n[dependencies]\n",
+        pkg_name
+    );
+    let main_src = "fn greeting() -> u32 { 42 }\n\nfn main() {\n    print(greeting());\n}\n\nfn test_greeting() -> bool {\n    greeting() == 42\n}\n";
+    if let Err(e) = std::fs::write(dir.join("rune.toml"), manifest) {
+        return usage_error(&format!("error: cannot write rune.toml: {}", e));
+    }
+    if let Err(e) = std::fs::write(src_dir.join("main.rune"), main_src) {
+        return usage_error(&format!("error: cannot write src/main.rune: {}", e));
+    }
+    println!("created package `{}`", pkg_name);
+    ExitCode::SUCCESS
 }
 
 /// Compile a program and run its `main()`, returning the printed lines or a

@@ -1,0 +1,29 @@
+// The sample `demo` package. It depends on the local `mathx` package (exposed
+// under `mathx::`) and on the standard library (`std::`).
+
+use std::math::clamp_u32;
+
+fn area_of_square(side: u32) -> u32 {
+    // `mathx::square` comes from the path dependency.
+    mathx::square(side)
+}
+
+fn main() {
+    print(area_of_square(5));          // 25  (via dependency)
+    print(clamp_u32(250, 0, 64));      // 64  (via std)
+    print(mathx::add(20, 22));         // 42
+}
+
+// Zero-arg, bool-returning functions named `test_*` are run by `runec test`.
+
+fn test_square_dep() -> bool {
+    mathx::square(6) == 36
+}
+
+fn test_add_dep() -> bool {
+    mathx::add(20, 22) == 42
+}
+
+fn test_std_clamp() -> bool {
+    clamp_u32(250, 0, 64) == 64
+}
