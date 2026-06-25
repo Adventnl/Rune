@@ -46,6 +46,9 @@ pub enum Type {
     Struct(String),
     /// A named (tagged) enum type.
     Enum(String),
+    /// An anonymous tuple type `(T0, T1, ...)`. Always has 2+ elements (a
+    /// 1-tuple is just the element; the 0-tuple is [`Type::Unit`]).
+    Tuple(Vec<Type>),
 }
 
 impl Type {
@@ -74,6 +77,10 @@ impl std::fmt::Display for Type {
             Type::Bit(n) => write!(f, "bit<{}>", n),
             Type::Array(t, n) => write!(f, "[{}; {}]", t, n),
             Type::Struct(n) | Type::Enum(n) => write!(f, "{}", n),
+            Type::Tuple(ts) => {
+                let parts: Vec<String> = ts.iter().map(|t| t.to_string()).collect();
+                write!(f, "({})", parts.join(", "))
+            }
         }
     }
 }
@@ -226,12 +233,21 @@ pub enum Place {
         index: Box<Expr>,
         ty: Type,
     },
+    /// A tuple element of a place, e.g. `t.0`.
+    TupleField {
+        base: Box<Place>,
+        index: usize,
+        ty: Type,
+    },
 }
 
 impl Place {
     pub fn ty(&self) -> &Type {
         match self {
-            Place::Local { ty, .. } | Place::Field { ty, .. } | Place::Index { ty, .. } => ty,
+            Place::Local { ty, .. }
+            | Place::Field { ty, .. }
+            | Place::Index { ty, .. }
+            | Place::TupleField { ty, .. } => ty,
         }
     }
 }
@@ -282,8 +298,12 @@ pub enum ExprKind {
         tag: usize,
         args: Vec<Expr>,
     },
+    /// Construct a tuple value from its elements.
+    MakeTuple(Vec<Expr>),
     /// Read a struct field by resolved index.
     Field { base: Box<Expr>, index: usize },
+    /// Read a tuple element by position, e.g. `t.0`.
+    TupleField { base: Box<Expr>, index: usize },
     /// Index into an array.
     Index { base: Box<Expr>, index: Box<Expr> },
     /// Array literal.
@@ -304,10 +324,12 @@ pub enum ExprKind {
     Block(Block),
 }
 
-/// One arm of a typed `match`.
+/// One arm of a typed `match`. An optional `guard` (a `bool` expression) must
+/// evaluate true for the arm to fire.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arm {
     pub pattern: Pattern,
+    pub guard: Option<Expr>,
     pub body: Expr,
 }
 
@@ -322,6 +344,12 @@ pub enum Pattern {
     Int(i128),
     /// Boolean literal.
     Bool(bool),
+    /// Integer range. `inclusive` selects `lo..=hi` vs the half-open `lo..hi`.
+    Range {
+        lo: i128,
+        hi: i128,
+        inclusive: bool,
+    },
     /// `Variant(sub, ...)` — `tag` indexes the enum's variants and `subpatterns`
     /// match its payload fields positionally.
     Variant {
@@ -329,6 +357,11 @@ pub enum Pattern {
         tag: usize,
         subpatterns: Vec<Pattern>,
     },
+    /// Tuple pattern, matching each element positionally.
+    Tuple(Vec<Pattern>),
+    /// Or-pattern: matches if any alternative matches. All alternatives bind the
+    /// same names with the same types.
+    Or(Vec<Pattern>),
 }
 
 /// Unary operators (resolved; semantics fixed by operand type).

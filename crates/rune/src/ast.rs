@@ -124,6 +124,8 @@ pub enum TypeExpr {
     /// A named type, possibly module-qualified (resolved later to a struct or
     /// enum), e.g. `Shape` or `geom::Point`.
     Named(Path),
+    /// A tuple type `(T0, T1, ...)` with 2+ elements.
+    Tuple(Vec<TypeExpr>),
     /// The unit type, written `()`.
     Unit,
 }
@@ -200,6 +202,14 @@ pub enum Expr {
         field: String,
         span: Span,
     },
+    /// Tuple element access `expr.0`.
+    TupleField {
+        base: Box<Expr>,
+        index: u64,
+        span: Span,
+    },
+    /// Tuple literal `(e0, e1, ...)` with 2+ elements.
+    Tuple { elems: Vec<Expr>, span: Span },
     /// Array indexing `expr[index]`.
     Index {
         base: Box<Expr>,
@@ -238,16 +248,18 @@ pub enum ElseBranch {
     If(Expr),
 }
 
-/// A single `pattern => body` arm of a `match`.
+/// A single `pattern [if guard] => body` arm of a `match`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// An optional boolean guard (`pattern if cond => ...`). A guarded arm only
+    /// fires when the guard is true, and never counts toward exhaustiveness.
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }
 
-/// A match pattern. v1 keeps patterns intentionally small but expressive enough
-/// for exhaustiveness checking over enums and bools.
+/// A match pattern.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Pattern {
     /// `_`
@@ -258,6 +270,13 @@ pub enum Pattern {
     Int { value: i128, span: Span },
     /// A boolean literal pattern.
     Bool { value: bool, span: Span },
+    /// An inclusive/half-open integer range pattern: `lo..=hi` or `lo..hi`.
+    Range {
+        lo: i128,
+        hi: i128,
+        inclusive: bool,
+        span: Span,
+    },
     /// An enum variant pattern `Variant(sub, ...)` (or `Variant` for unit-like),
     /// where the variant may be path-qualified, e.g. `Shape::Rect(w, h)`.
     Variant {
@@ -265,6 +284,10 @@ pub enum Pattern {
         subpatterns: Vec<Pattern>,
         span: Span,
     },
+    /// A tuple pattern `(p0, p1, ...)`.
+    Tuple { elems: Vec<Pattern>, span: Span },
+    /// An or-pattern `p0 | p1 | ...`: matches if any alternative matches.
+    Or { alts: Vec<Pattern>, span: Span },
 }
 
 impl Expr {
@@ -279,6 +302,8 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
             | Expr::Field { span, .. }
+            | Expr::TupleField { span, .. }
+            | Expr::Tuple { span, .. }
             | Expr::Index { span, .. }
             | Expr::Array { span, .. }
             | Expr::StructLit { span, .. }
@@ -296,7 +321,10 @@ impl Pattern {
             | Pattern::Binding { span, .. }
             | Pattern::Int { span, .. }
             | Pattern::Bool { span, .. }
-            | Pattern::Variant { span, .. } => *span,
+            | Pattern::Range { span, .. }
+            | Pattern::Variant { span, .. }
+            | Pattern::Tuple { span, .. }
+            | Pattern::Or { span, .. } => *span,
         }
     }
 }

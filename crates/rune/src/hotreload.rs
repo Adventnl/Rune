@@ -269,6 +269,9 @@ fn value_depends_on_changed_type(value: &Value, changed: &BTreeSet<String>) -> b
                     .iter()
                     .any(|a| value_depends_on_changed_type(a, changed))
         }
+        Value::Tuple(elems) => elems
+            .iter()
+            .any(|e| value_depends_on_changed_type(e, changed)),
     }
 }
 

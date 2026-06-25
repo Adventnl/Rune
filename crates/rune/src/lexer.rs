@@ -50,6 +50,7 @@ pub enum Tok {
     ColonColon, // ::
     Dot,
     DotDot,
+    DotDotEq, // ..=
     Arrow,    // ->
     FatArrow, // =>
     Eq,       // =
@@ -248,7 +249,11 @@ fn keyword_or_ident(word: &str) -> Tok {
 /// Match a single operator/punctuation token at the start of `b`, returning the
 /// token and how many bytes it consumed. Longest match wins.
 fn match_operator(b: &[u8]) -> Option<(Tok, usize)> {
-    // Two-character operators first.
+    // Three-character operators first.
+    if b.len() >= 3 && &b[..3] == b"..=" {
+        return Some((Tok::DotDotEq, 3));
+    }
+    // Two-character operators next.
     if b.len() >= 2 {
         let two = &b[..2];
         let t = match two {

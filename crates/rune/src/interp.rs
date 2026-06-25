@@ -31,6 +31,8 @@ pub enum Value {
     Struct(String, Vec<Value>),
     /// An enum value: the enum name, the variant tag, and the payload.
     Enum(String, usize, Vec<Value>),
+    /// A tuple value.
+    Tuple(Vec<Value>),
     /// The unit value.
     Unit,
 }
@@ -245,6 +247,15 @@ impl<'a> Eval<'a> {
                 }
                 self.store(base, cur, env)
             }
+            ir::Place::TupleField { base, index, .. } => {
+                let mut cur = self.load(base, env)?;
+                if let Value::Tuple(elems) = &mut cur {
+                    elems[*index] = v;
+                } else {
+                    return Err(rt("tuple assignment on non-tuple value"));
+                }
+                self.store(base, cur, env)
+            }
             ir::Place::Index { base, index, .. } => {
                 let idx = int_as_i128(&self.eval_expr(index, env)?);
                 let mut cur = self.load(base, env)?;
@@ -273,6 +284,13 @@ impl<'a> Eval<'a> {
                 match base_v {
                     Value::Struct(_, fields) => Ok(fields[*index].clone()),
                     _ => Err(rt("field access on non-struct value")),
+                }
+            }
+            ir::Place::TupleField { base, index, .. } => {
+                let base_v = self.load(base, env)?;
+                match base_v {
+                    Value::Tuple(elems) => Ok(elems[*index].clone()),
+                    _ => Err(rt("tuple access on non-tuple value")),
                 }
             }
             ir::Place::Index { base, index, .. } => {
@@ -350,11 +368,25 @@ impl<'a> Eval<'a> {
                 }
                 Ok(Value::Enum(name.clone(), *tag, vals))
             }
+            ir::ExprKind::MakeTuple(elems) => {
+                let mut vals = Vec::with_capacity(elems.len());
+                for el in elems {
+                    vals.push(self.eval_expr(el, env)?);
+                }
+                Ok(Value::Tuple(vals))
+            }
             ir::ExprKind::Field { base, index } => {
                 let v = self.eval_expr(base, env)?;
                 match v {
                     Value::Struct(_, fields) => Ok(fields[*index].clone()),
                     _ => Err(rt("field access on non-struct value")),
+                }
+            }
+            ir::ExprKind::TupleField { base, index } => {
+                let v = self.eval_expr(base, env)?;
+                match v {
+                    Value::Tuple(elems) => Ok(elems[*index].clone()),
+                    _ => Err(rt("tuple access on non-tuple value")),
                 }
             }
             ir::ExprKind::Index { base, index } => {
@@ -393,6 +425,21 @@ impl<'a> Eval<'a> {
                     let mut binds = HashMap::new();
                     if pattern_matches(&arm.pattern, &v, &mut binds) {
                         env.push(binds);
+                        // A guard is evaluated in the arm's bindings; if it is
+                        // false, fall through to the next arm.
+                        if let Some(guard) = &arm.guard {
+                            match self.eval_expr(guard, env) {
+                                Ok(Value::Bool(true)) => {}
+                                Ok(_) => {
+                                    env.pop();
+                                    continue;
+                                }
+                                Err(e) => {
+                                    env.pop();
+                                    return Err(e);
+                                }
+                            }
+                        }
                         let r = self.eval_expr(&arm.body, env);
                         env.pop();
                         return r;
@@ -445,6 +492,10 @@ impl<'a> Eval<'a> {
                     format!("{}({})", vname, parts.join(", "))
                 }
             }
+            Value::Tuple(elems) => {
+                let parts: Vec<String> = elems.iter().map(|a| self.format_value(a)).collect();
+                format!("({})", parts.join(", "))
+            }
         }
     }
 }
@@ -464,6 +515,18 @@ fn pattern_matches(p: &ir::Pattern, v: &Value, binds: &mut HashMap<String, Value
             _ => false,
         },
         ir::Pattern::Bool(target) => matches!(v, Value::Bool(b) if b == target),
+        ir::Pattern::Range { lo, hi, inclusive } => {
+            let n = match v {
+                Value::Int(n, _) => *n,
+                Value::Bit(n, _) => *n as i128,
+                _ => return false,
+            };
+            if *inclusive {
+                n >= *lo && n <= *hi
+            } else {
+                n >= *lo && n < *hi
+            }
+        }
         ir::Pattern::Variant {
             tag, subpatterns, ..
         } => match v {
@@ -475,6 +538,14 @@ fn pattern_matches(p: &ir::Pattern, v: &Value, binds: &mut HashMap<String, Value
             }
             _ => false,
         },
+        ir::Pattern::Tuple(subs) => match v {
+            Value::Tuple(elems) if elems.len() == subs.len() => subs
+                .iter()
+                .zip(elems.iter())
+                .all(|(sp, a)| pattern_matches(sp, a, binds)),
+            _ => false,
+        },
+        ir::Pattern::Or(alts) => alts.iter().any(|alt| pattern_matches(alt, v, binds)),
     }
 }
 
@@ -710,6 +781,86 @@ mod tests {
         let module = compile(src).expect("should typecheck");
         let mut interp = Interpreter::new(module);
         interp.run_main().expect("should run")
+    }
+
+    #[test]
+    fn tuples_construct_index_destructure() {
+        let src = r#"
+            fn divmod(a: u32, b: u32) -> (u32, u32) { (a / b, a % b) }
+            fn main() {
+                let q: (u32, u32) = divmod(17, 5);
+                print(q.0);
+                print(q.1);
+                let (d, m) = divmod(20, 6);
+                print(d);
+                print(m);
+                print(q);
+            }
+        "#;
+        assert_eq!(run(src), vec!["3", "2", "3", "2", "(3, 2)"]);
+    }
+
+    #[test]
+    fn mutable_tuple_field_assignment() {
+        let src = r#"
+            fn main() {
+                let mut p: (u32, u32) = (1, 2);
+                p.0 = p.0 + 10;
+                print(p.0);
+                print(p.1);
+            }
+        "#;
+        assert_eq!(run(src), vec!["11", "2"]);
+    }
+
+    #[test]
+    fn match_guards_or_and_range_patterns() {
+        let src = r#"
+            fn classify(n: u32) -> u32 {
+                match n {
+                    0 => 100,
+                    1 | 2 | 3 => 200,
+                    4..=9 => 300,
+                    x if x > 100 => 999,
+                    _ => 0,
+                }
+            }
+            fn main() {
+                print(classify(0));
+                print(classify(2));
+                print(classify(7));
+                print(classify(9));
+                print(classify(500));
+                print(classify(42));
+            }
+        "#;
+        assert_eq!(run(src), vec!["100", "200", "300", "300", "999", "0"]);
+    }
+
+    #[test]
+    fn half_open_range_pattern_excludes_high() {
+        let src = r#"
+            fn f(n: u8) -> u8 { match n { 0..2 => 1, _ => 0 } }
+            fn main() { print(f(0)); print(f(1)); print(f(2)); }
+        "#;
+        assert_eq!(run(src), vec!["1", "1", "0"]);
+    }
+
+    #[test]
+    fn nested_tuple_pattern_in_match() {
+        let src = r#"
+            fn first_positive(p: (bool, u32)) -> u32 {
+                match p {
+                    (true, x) => x,
+                    _ => 0,
+                }
+            }
+            fn main() {
+                print(first_positive((true, 42)));
+                print(first_positive((false, 42)));
+            }
+        "#;
+        assert_eq!(run(src), vec!["42", "0"]);
     }
 
     #[test]

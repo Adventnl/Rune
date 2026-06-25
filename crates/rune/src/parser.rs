@@ -315,8 +315,26 @@ impl<'a> Parser<'a> {
             }
             Tok::LParen => {
                 self.bump();
-                self.expect(&Tok::RParen, "`)` (unit type)")?;
-                Ok(TypeExpr::Unit)
+                if self.eat(&Tok::RParen) {
+                    return Ok(TypeExpr::Unit);
+                }
+                let mut elems = Vec::new();
+                let mut trailing_comma = false;
+                while !self.at(&Tok::RParen) {
+                    elems.push(self.type_expr()?);
+                    if self.eat(&Tok::Comma) {
+                        trailing_comma = true;
+                    } else {
+                        trailing_comma = false;
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "`)` in type")?;
+                if elems.len() == 1 && !trailing_comma {
+                    Ok(elems.into_iter().next().unwrap())
+                } else {
+                    Ok(TypeExpr::Tuple(elems))
+                }
             }
             Tok::Ident(_) => {
                 let segs = self.name_path()?;
@@ -352,7 +370,7 @@ impl<'a> Parser<'a> {
             // Statement keywords.
             match self.peek() {
                 Tok::Let => {
-                    stmts.push(self.let_stmt()?);
+                    stmts.extend(self.let_stmt()?);
                     continue;
                 }
                 Tok::While => {
@@ -420,10 +438,58 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn let_stmt(&mut self) -> PResult<Stmt> {
+    /// Parse a `let` binding, producing one or more statements. A tuple
+    /// destructuring `let (a, b) = e;` desugars to a hidden temp plus one
+    /// binding per element (`let a = __let.0; ...`).
+    fn let_stmt(&mut self) -> PResult<Vec<Stmt>> {
         let start = self.span();
         self.expect(&Tok::Let, "`let`")?;
         let mutable = self.eat(&Tok::Mut);
+
+        // Tuple destructuring: `let (a, b, ...) = init;`
+        if self.at(&Tok::LParen) {
+            self.bump();
+            let mut names = Vec::new();
+            while !self.at(&Tok::RParen) {
+                let (n, _) = self.ident()?;
+                names.push(n);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen, "`)` in destructuring let")?;
+            self.expect(&Tok::Eq, "`=` in let binding")?;
+            let init = self.expr()?;
+            self.expect(&Tok::Semi, "`;` after let binding")?;
+            let span = start.merge(self.prev_span());
+
+            let tmp = format!("__let{}", span.start);
+            let mut out = vec![Stmt::Let {
+                name: tmp.clone(),
+                mutable: false,
+                ty: None,
+                init,
+                span,
+            }];
+            for (i, n) in names.into_iter().enumerate() {
+                out.push(Stmt::Let {
+                    name: n,
+                    mutable,
+                    ty: None,
+                    init: Expr::TupleField {
+                        base: Box::new(Expr::Ident {
+                            name: tmp.clone(),
+                            span,
+                        }),
+                        index: i as u64,
+                        span,
+                    },
+                    span,
+                });
+            }
+            return Ok(out);
+        }
+
         let (name, _) = self.ident()?;
         let ty = if self.eat(&Tok::Colon) {
             Some(self.type_expr()?)
@@ -433,13 +499,13 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.expr()?;
         self.expect(&Tok::Semi, "`;` after let binding")?;
-        Ok(Stmt::Let {
+        Ok(vec![Stmt::Let {
             name,
             mutable,
             ty,
             init,
             span: start.merge(self.prev_span()),
-        })
+        }])
     }
 
     fn while_stmt(&mut self) -> PResult<Stmt> {
@@ -573,13 +639,24 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Dot => {
                     self.bump();
-                    let (field, _) = self.ident()?;
-                    let span = expr.span().merge(self.prev_span());
-                    expr = Expr::Field {
-                        base: Box::new(expr),
-                        field,
-                        span,
-                    };
+                    // `expr.0` is tuple access; `expr.field` is struct access.
+                    if let Tok::Int(idx) = self.peek().clone() {
+                        self.bump();
+                        let span = expr.span().merge(self.prev_span());
+                        expr = Expr::TupleField {
+                            base: Box::new(expr),
+                            index: idx as u64,
+                            span,
+                        };
+                    } else {
+                        let (field, _) = self.ident()?;
+                        let span = expr.span().merge(self.prev_span());
+                        expr = Expr::Field {
+                            base: Box::new(expr),
+                            field,
+                            span,
+                        };
+                    }
                 }
                 Tok::LBracket => {
                     self.bump();
@@ -645,9 +722,25 @@ impl<'a> Parser<'a> {
                         span: span.merge(self.prev_span()),
                     }));
                 }
-                let inner = self.expr()?;
-                self.expect(&Tok::RParen, "`)`")?;
-                Ok(inner)
+                // Either a parenthesized expression `(e)` or a tuple `(e0, e1, ...)`.
+                let first = self.expr()?;
+                if self.at(&Tok::Comma) {
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) {
+                        if self.at(&Tok::RParen) {
+                            break; // allow trailing comma
+                        }
+                        elems.push(self.expr()?);
+                    }
+                    self.expect(&Tok::RParen, "`)`")?;
+                    Ok(Expr::Tuple {
+                        elems,
+                        span: span.merge(self.prev_span()),
+                    })
+                } else {
+                    self.expect(&Tok::RParen, "`)`")?;
+                    Ok(first)
+                }
             }
             Tok::LBracket => {
                 self.bump();
@@ -725,10 +818,16 @@ impl<'a> Parser<'a> {
         while !self.at(&Tok::RBrace) {
             let astart = self.span();
             let pattern = self.pattern()?;
+            let guard = if self.eat(&Tok::If) {
+                Some(self.expr_no_struct()?)
+            } else {
+                None
+            };
             self.expect(&Tok::FatArrow, "`=>` in match arm")?;
             let body = self.expr()?;
             arms.push(MatchArm {
                 pattern,
+                guard,
                 span: astart.merge(self.prev_span()),
                 body,
             });
@@ -744,7 +843,25 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a full pattern, including top-level or-patterns `p | q | ...`.
     fn pattern(&mut self) -> PResult<Pattern> {
+        let start = self.span();
+        let first = self.pattern_primary()?;
+        if self.at(&Tok::Pipe) {
+            let mut alts = vec![first];
+            while self.eat(&Tok::Pipe) {
+                alts.push(self.pattern_primary()?);
+            }
+            Ok(Pattern::Or {
+                alts,
+                span: start.merge(self.prev_span()),
+            })
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn pattern_primary(&mut self) -> PResult<Pattern> {
         let span = self.span();
         match self.peek().clone() {
             Tok::Ident(name) if name == "_" => {
@@ -753,8 +870,6 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(_) => {
                 let segs = self.name_path()?;
-                // Variant pattern if path-qualified, uppercase, or followed by `(`;
-                // otherwise a simple lowercase name is a binding.
                 let last_upper = segs
                     .last()
                     .and_then(|s| s.chars().next())
@@ -791,19 +906,62 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Pattern::Bool { value: false, span })
             }
-            Tok::Minus => {
+            // Tuple pattern `(p0, p1, ...)`; `(p)` is just `p`; `()` matches unit.
+            Tok::LParen => {
                 self.bump();
-                let v = self.int_literal("integer pattern")?;
-                Ok(Pattern::Int {
-                    value: -v,
-                    span: span.merge(self.prev_span()),
-                })
+                let mut elems = Vec::new();
+                let mut trailing_comma = false;
+                while !self.at(&Tok::RParen) {
+                    elems.push(self.pattern()?);
+                    if self.eat(&Tok::Comma) {
+                        trailing_comma = true;
+                    } else {
+                        trailing_comma = false;
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "`)`")?;
+                if elems.len() == 1 && !trailing_comma {
+                    Ok(elems.into_iter().next().unwrap())
+                } else {
+                    Ok(Pattern::Tuple {
+                        elems,
+                        span: span.merge(self.prev_span()),
+                    })
+                }
             }
-            Tok::Int(value) => {
-                self.bump();
-                Ok(Pattern::Int { value, span })
+            // Integer literal or range pattern.
+            Tok::Minus | Tok::Int(_) => {
+                let lo = self.int_signed_pattern()?;
+                if self.at(&Tok::DotDot) || self.at(&Tok::DotDotEq) {
+                    let inclusive = self.eat(&Tok::DotDotEq);
+                    if !inclusive {
+                        self.expect(&Tok::DotDot, "`..` or `..=` in range pattern")?;
+                    }
+                    let hi = self.int_signed_pattern()?;
+                    Ok(Pattern::Range {
+                        lo,
+                        hi,
+                        inclusive,
+                        span: span.merge(self.prev_span()),
+                    })
+                } else {
+                    Ok(Pattern::Int {
+                        value: lo,
+                        span: span.merge(self.prev_span()),
+                    })
+                }
             }
             other => Err(self.err(format!("expected a pattern, found {}", describe(&other)))),
+        }
+    }
+
+    /// Parse an optionally-negated integer literal (a range/int pattern bound).
+    fn int_signed_pattern(&mut self) -> PResult<i128> {
+        if self.eat(&Tok::Minus) {
+            Ok(-self.int_literal("integer pattern")?)
+        } else {
+            self.int_literal("integer pattern")
         }
     }
 }

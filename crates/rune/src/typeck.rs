@@ -403,6 +403,13 @@ impl Checker {
             ast::TypeExpr::Array { elem, len } => {
                 Type::Array(Box::new(self.resolve_ty(elem, cur, span)?), *len)
             }
+            ast::TypeExpr::Tuple(elems) => {
+                let mut ts = Vec::new();
+                for e in elems {
+                    ts.push(self.resolve_ty(e, cur, span)?);
+                }
+                Type::Tuple(ts)
+            }
             ast::TypeExpr::Named(path) => match self.resolve_item(cur, path) {
                 Some((f, ItemKind::Struct)) => Type::Struct(f),
                 Some((f, ItemKind::Enum)) => Type::Enum(f),
@@ -478,6 +485,14 @@ impl Checker {
     }
     fn lookup(&self, name: &str) -> Option<&Local> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+    /// Names bound in the innermost scope (used to detect bindings introduced by
+    /// an or-pattern alternative).
+    fn scope_names(&self) -> Vec<String> {
+        self.scopes
+            .last()
+            .map(|s| s.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     // ---- blocks & statements -------------------------------------------
@@ -699,6 +714,15 @@ impl Checker {
                     ty,
                 })
             }
+            ast::Expr::TupleField { base, index, span } => {
+                let base_place = self.check_place(base)?;
+                let ty = self.tuple_elem_ty(base_place.ty(), *index, *span)?;
+                Ok(ir::Place::TupleField {
+                    base: Box::new(base_place),
+                    index: *index as usize,
+                    ty,
+                })
+            }
             ast::Expr::Index { base, index, span } => {
                 let base_place = self.check_place(base)?;
                 let elem = match base_place.ty() {
@@ -729,6 +753,24 @@ impl Checker {
                 Stage::Type,
                 "invalid assignment target",
                 other.span(),
+            )),
+        }
+    }
+
+    /// The type of tuple element `index`, with a bounds check.
+    fn tuple_elem_ty(&self, base_ty: &Type, index: u64, span: Span) -> Result<Type, Diagnostic> {
+        match base_ty {
+            Type::Tuple(ts) => ts.get(index as usize).cloned().ok_or_else(|| {
+                Diagnostic::new(
+                    Stage::Type,
+                    format!("tuple of {} element(s) has no field `.{}`", ts.len(), index),
+                    span,
+                )
+            }),
+            other => Err(Diagnostic::new(
+                Stage::Type,
+                format!("cannot access `.{}` on non-tuple type `{}`", index, other),
+                span,
             )),
         }
     }
@@ -795,6 +837,40 @@ impl Checker {
                     },
                     ty,
                 ))
+            }
+            ast::Expr::TupleField { base, index, span } => {
+                let base_ir = self.check_expr(base, None)?;
+                let ty = self.tuple_elem_ty(&base_ir.ty, *index, *span)?;
+                Ok(ir::Expr::new(
+                    ir::ExprKind::TupleField {
+                        base: Box::new(base_ir),
+                        index: *index as usize,
+                    },
+                    ty,
+                ))
+            }
+            ast::Expr::Tuple { elems, span } => {
+                let elem_expected: Vec<Option<Type>> = match expected {
+                    Some(Type::Tuple(ts)) if ts.len() == elems.len() => {
+                        ts.iter().map(|t| Some(t.clone())).collect()
+                    }
+                    _ => vec![None; elems.len()],
+                };
+                if elems.len() < 2 {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        "a tuple must have at least two elements".to_string(),
+                        *span,
+                    ));
+                }
+                let mut irs = Vec::new();
+                let mut tys = Vec::new();
+                for (e, ex) in elems.iter().zip(elem_expected.iter()) {
+                    let ir = self.check_expr(e, ex.as_ref())?;
+                    tys.push(ir.ty.clone());
+                    irs.push(ir);
+                }
+                Ok(ir::Expr::new(ir::ExprKind::MakeTuple(irs), Type::Tuple(tys)))
             }
             ast::Expr::Index { base, index, span } => {
                 let base_ir = self.check_expr(base, None)?;
@@ -1431,11 +1507,20 @@ impl Checker {
             let pat_result = self
                 .check_pattern(&arm.pattern, &scrut_ty)
                 .and_then(|pat| {
+                    // A guard (if any) is a bool checked in the pattern's bindings.
+                    let guard = match &arm.guard {
+                        Some(g) => {
+                            let gi = self.check_expr(g, Some(&Type::Bool))?;
+                            self.expect_ty(&gi.ty, &Type::Bool, g.span(), "match guard")?;
+                            Some(gi)
+                        }
+                        None => None,
+                    };
                     let body = self.check_expr(&arm.body, result_ty.as_ref())?;
-                    Ok((pat, body))
+                    Ok((pat, guard, body))
                 });
             self.pop_scope();
-            let (pat, body) = pat_result?;
+            let (pat, guard, body) = pat_result?;
 
             match &result_ty {
                 Some(t) if t != &body.ty => {
@@ -1451,7 +1536,11 @@ impl Checker {
                 None => result_ty = Some(body.ty.clone()),
                 _ => {}
             }
-            ir_arms.push(ir::Arm { pattern: pat, body });
+            ir_arms.push(ir::Arm {
+                pattern: pat,
+                guard,
+                body,
+            });
         }
 
         self.check_exhaustive(&scrut_ty, arms, span)?;
@@ -1492,6 +1581,88 @@ impl Checker {
                     ));
                 }
                 Ok(ir::Pattern::Int(*value))
+            }
+            ast::Pattern::Range {
+                lo,
+                hi,
+                inclusive,
+                span,
+            } => {
+                if !ty.is_integer() {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        format!("range pattern cannot match a value of type `{}`", ty),
+                        *span,
+                    ));
+                }
+                if !fits(*lo, ty) || !fits(*hi, ty) {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        format!("range bound does not fit in `{}`", ty),
+                        *span,
+                    ));
+                }
+                if lo > hi || (!inclusive && lo == hi) {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        "range pattern is empty (lo must be <= hi)".to_string(),
+                        *span,
+                    ));
+                }
+                Ok(ir::Pattern::Range {
+                    lo: *lo,
+                    hi: *hi,
+                    inclusive: *inclusive,
+                })
+            }
+            ast::Pattern::Tuple { elems, span } => {
+                let tys = match ty {
+                    Type::Tuple(ts) => ts.clone(),
+                    other => {
+                        return Err(Diagnostic::new(
+                            Stage::Type,
+                            format!("tuple pattern cannot match a value of type `{}`", other),
+                            *span,
+                        ))
+                    }
+                };
+                if elems.len() != tys.len() {
+                    return Err(Diagnostic::new(
+                        Stage::Type,
+                        format!(
+                            "tuple pattern has {} element(s) but the value has {}",
+                            elems.len(),
+                            tys.len()
+                        ),
+                        *span,
+                    ));
+                }
+                let mut subs = Vec::new();
+                for (e, t) in elems.iter().zip(tys.iter()) {
+                    subs.push(self.check_pattern(e, t)?);
+                }
+                Ok(ir::Pattern::Tuple(subs))
+            }
+            ast::Pattern::Or { alts, span } => {
+                // Each alternative is checked against the same type; for v1, the
+                // alternatives must introduce no new bindings (keeps binding
+                // types unambiguous) — except a single binding/wildcard, which is
+                // not an or-pattern anyway.
+                let before: Vec<String> = self.scope_names();
+                let mut ir_alts = Vec::new();
+                for alt in alts {
+                    let a = self.check_pattern(alt, ty)?;
+                    let after = self.scope_names();
+                    if after.len() != before.len() {
+                        return Err(Diagnostic::new(
+                            Stage::Type,
+                            "or-pattern alternatives may not introduce bindings".to_string(),
+                            *span,
+                        ));
+                    }
+                    ir_alts.push(a);
+                }
+                Ok(ir::Pattern::Or(ir_alts))
             }
             ast::Pattern::Bool { value, span } => {
                 if ty != &Type::Bool {
@@ -1567,12 +1738,11 @@ impl Checker {
         arms: &[ast::MatchArm],
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let has_catch_all = arms.iter().any(|a| {
-            matches!(
-                a.pattern,
-                ast::Pattern::Wildcard { .. } | ast::Pattern::Binding { .. }
-            )
-        });
+        // A guarded arm can fail at runtime, so it never makes a match
+        // exhaustive on its own.
+        let has_catch_all = arms
+            .iter()
+            .any(|a| a.guard.is_none() && is_irrefutable(&a.pattern));
         if has_catch_all {
             return Ok(());
         }
@@ -1582,15 +1752,22 @@ impl Checker {
                 let ed = &self.enums[name];
                 let mut covered = vec![false; ed.variants.len()];
                 let cur = self.cur_mod.clone();
+                // Collect variant-covering patterns, flattening or-patterns and
+                // skipping guarded arms (a guard may fail).
                 for a in arms {
-                    if let ast::Pattern::Variant {
-                        path, subpatterns, ..
-                    } = &a.pattern
-                    {
-                        if subpatterns.iter().all(is_irrefutable) {
-                            if let Some((efqn, tag)) = self.resolve_variant(&cur, path) {
-                                if efqn == *name {
-                                    covered[tag] = true;
+                    if a.guard.is_some() {
+                        continue;
+                    }
+                    for pat in flatten_or(&a.pattern) {
+                        if let ast::Pattern::Variant {
+                            path, subpatterns, ..
+                        } = pat
+                        {
+                            if subpatterns.iter().all(is_irrefutable) {
+                                if let Some((efqn, tag)) = self.resolve_variant(&cur, path) {
+                                    if efqn == *name {
+                                        covered[tag] = true;
+                                    }
                                 }
                             }
                         }
@@ -1621,11 +1798,16 @@ impl Checker {
                 let mut t = false;
                 let mut f = false;
                 for a in arms {
-                    if let ast::Pattern::Bool { value, .. } = a.pattern {
-                        if value {
-                            t = true;
-                        } else {
-                            f = true;
+                    if a.guard.is_some() {
+                        continue;
+                    }
+                    for pat in flatten_or(&a.pattern) {
+                        if let ast::Pattern::Bool { value, .. } = pat {
+                            if *value {
+                                t = true;
+                            } else {
+                                f = true;
+                            }
                         }
                     }
                 }
@@ -1683,13 +1865,24 @@ fn fqn(cur: &[String], name: &str) -> String {
     }
 }
 
-/// A pattern is irrefutable if it always matches: wildcard or binding, or a
-/// variant whose subpatterns are all irrefutable.
+/// A pattern is irrefutable if it always matches: wildcard or binding, a tuple
+/// of irrefutable patterns, or an or-pattern with an irrefutable alternative.
 fn is_irrefutable(p: &ast::Pattern) -> bool {
-    matches!(
-        p,
-        ast::Pattern::Wildcard { .. } | ast::Pattern::Binding { .. }
-    )
+    match p {
+        ast::Pattern::Wildcard { .. } | ast::Pattern::Binding { .. } => true,
+        ast::Pattern::Tuple { elems, .. } => elems.iter().all(is_irrefutable),
+        ast::Pattern::Or { alts, .. } => alts.iter().any(is_irrefutable),
+        _ => false,
+    }
+}
+
+/// Flatten an or-pattern into its leaf alternatives (recursively); any other
+/// pattern yields itself. Used for exhaustiveness over enums and bools.
+fn flatten_or(p: &ast::Pattern) -> Vec<&ast::Pattern> {
+    match p {
+        ast::Pattern::Or { alts, .. } => alts.iter().flat_map(flatten_or).collect(),
+        other => vec![other],
+    }
 }
 
 /// Syntactic test for "a bare integer literal" (possibly negated), used to

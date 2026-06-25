@@ -376,8 +376,24 @@ fn ty_width(t: &Type, module: &ir::Module) -> Result<u32, String> {
                 .ok_or_else(|| format!("unknown enum `{}`", name))?;
             Ok(enum_tag_bits(def) + enum_payload_bits(def, module)?)
         }
+        Type::Tuple(ts) => {
+            let mut total = 0u32;
+            for t in ts {
+                total += ty_width(t, module)?;
+            }
+            Ok(total)
+        }
         Type::Unit => Err("unit type cannot be a hardware value".to_string()),
     }
+}
+
+/// Bit offset (low end) of tuple element `index` within its packed value.
+fn tuple_elem_offset(ts: &[Type], index: usize, module: &ir::Module) -> Result<u32, String> {
+    let mut off = 0u32;
+    for t in &ts[..index] {
+        off += ty_width(t, module)?;
+    }
+    Ok(off)
 }
 
 /// Number of bits needed to hold the variant tag: `ceil(log2(num_variants))`,
@@ -809,6 +825,17 @@ impl<'a> Lowerer<'a> {
                 let new_base = self.replace_slice(&base_net, off, ew, &rhs);
                 self.rebuild_place(base, new_base)
             }
+            ir::Place::TupleField { base, index, .. } => {
+                let ts = match base.ty() {
+                    Type::Tuple(ts) => ts.clone(),
+                    _ => return Err("tuple assignment on non-tuple".to_string()),
+                };
+                let base_net = self.load_place(base)?;
+                let off = tuple_elem_offset(&ts, *index, self.module)?;
+                let fwidth = ty_width(&ts[*index], self.module)?;
+                let new_base = self.replace_slice(&base_net, off, fwidth, &rhs);
+                self.rebuild_place(base, new_base)
+            }
         }
     }
 
@@ -845,6 +872,16 @@ impl<'a> Lowerer<'a> {
                     .ok_or("dynamic array index not supported")?;
                 let base_net = self.load_place(base)?;
                 Ok(self.slice(&base_net, (idx as u32) * ew, ew))
+            }
+            ir::Place::TupleField { base, index, .. } => {
+                let ts = match base.ty() {
+                    Type::Tuple(ts) => ts.clone(),
+                    _ => return Err("tuple access on non-tuple".to_string()),
+                };
+                let base_net = self.load_place(base)?;
+                let off = tuple_elem_offset(&ts, *index, self.module)?;
+                let fwidth = ty_width(&ts[*index], self.module)?;
+                Ok(self.slice(&base_net, off, fwidth))
             }
         }
     }
@@ -1130,7 +1167,21 @@ impl<'a> Lowerer<'a> {
             ir::ExprKind::Field { base, index } => self.lower_field(base, *index),
             ir::ExprKind::Index { base, index } => self.lower_index(base, index),
             ir::ExprKind::Array(elems) => self.lower_array(elems, &e.ty),
+            // Tuples pack exactly like structs (element 0 in the LOW bits).
+            ir::ExprKind::MakeTuple(elems) => self.lower_make_struct(elems, &e.ty),
+            ir::ExprKind::TupleField { base, index } => self.lower_tuple_field(base, *index),
         }
+    }
+
+    fn lower_tuple_field(&mut self, base: &ir::Expr, index: usize) -> Result<Net, String> {
+        let ts = match &base.ty {
+            Type::Tuple(ts) => ts.clone(),
+            _ => return Err("tuple access on non-tuple".to_string()),
+        };
+        let off = tuple_elem_offset(&ts, index, self.module)?;
+        let fwidth = ty_width(&ts[index], self.module)?;
+        let base_net = self.lower_expr(base)?;
+        Ok(self.slice(&base_net, off, fwidth))
     }
 
     /// Build a struct value: concat field nets with field 0 in the LOW bits
@@ -1556,6 +1607,75 @@ impl<'a> Lowerer<'a> {
                     off += fw;
                 }
                 Ok(cond)
+            }
+            ir::Pattern::Range { lo, hi, inclusive } => {
+                let ge = self.emit(
+                    1,
+                    Expr::Bin {
+                        op: BinOp::Ge,
+                        l: Box::new(scrut.expr.clone()),
+                        r: Box::new(Expr::Const {
+                            value: (*lo as u128) & mask(scrut.width),
+                            width: scrut.width,
+                        }),
+                    },
+                );
+                let hi_op = if *inclusive { BinOp::Le } else { BinOp::Lt };
+                let le = self.emit(
+                    1,
+                    Expr::Bin {
+                        op: hi_op,
+                        l: Box::new(scrut.expr.clone()),
+                        r: Box::new(Expr::Const {
+                            value: (*hi as u128) & mask(scrut.width),
+                            width: scrut.width,
+                        }),
+                    },
+                );
+                let both = self.emit(
+                    1,
+                    Expr::Bin {
+                        op: BinOp::And,
+                        l: Box::new(ge.expr),
+                        r: Box::new(le.expr),
+                    },
+                );
+                Ok(Some(both.expr))
+            }
+            // Or-pattern alternatives are binding-free (enforced by the
+            // typechecker), so the condition is the OR of the alternatives'.
+            ir::Pattern::Or(alts) => {
+                let mut acc: Option<Expr> = None;
+                let mut irrefutable = false;
+                for alt in alts {
+                    match self.bind_pattern(alt, scrut, tag_bits, payload_bits, is_enum)? {
+                        None => irrefutable = true,
+                        Some(c) => {
+                            acc = Some(match acc.take() {
+                                Some(a) => {
+                                    self.emit(
+                                        1,
+                                        Expr::Bin {
+                                            op: BinOp::Or,
+                                            l: Box::new(a),
+                                            r: Box::new(c),
+                                        },
+                                    )
+                                    .expr
+                                }
+                                None => c,
+                            });
+                        }
+                    }
+                }
+                if irrefutable {
+                    Ok(None)
+                } else {
+                    Ok(acc)
+                }
+            }
+            ir::Pattern::Tuple(_) => {
+                Err("tuple patterns in `match` are not yet supported by codegen".to_string())
             }
         }
     }

@@ -236,6 +236,7 @@ fn is_hardware_type(ty: &Type, module: &Module) -> bool {
                 visited.remove(name);
                 ok
             }
+            Type::Tuple(ts) => ts.iter().all(|t| go(t, module, visited)),
         }
     }
     go(ty, module, &mut BTreeSet::new())
@@ -282,7 +283,9 @@ fn scan_place(place: &crate::ir::Place, uses_print: &mut bool, uses_while: &mut 
     use crate::ir::Place;
     match place {
         Place::Local { .. } => {}
-        Place::Field { base, .. } => scan_place(base, uses_print, uses_while),
+        Place::Field { base, .. } | Place::TupleField { base, .. } => {
+            scan_place(base, uses_print, uses_while)
+        }
         Place::Index { base, index, .. } => {
             scan_place(base, uses_print, uses_while);
             scan_expr(index, uses_print, uses_while);
@@ -317,7 +320,14 @@ fn scan_expr(expr: &Expr, uses_print: &mut bool, uses_while: &mut bool) {
                 scan_expr(a, uses_print, uses_while);
             }
         }
-        ExprKind::Field { base, .. } => scan_expr(base, uses_print, uses_while),
+        ExprKind::MakeTuple(elems) => {
+            for e in elems {
+                scan_expr(e, uses_print, uses_while);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            scan_expr(base, uses_print, uses_while)
+        }
         ExprKind::Index { base, index } => {
             scan_expr(base, uses_print, uses_while);
             scan_expr(index, uses_print, uses_while);
@@ -339,6 +349,9 @@ fn scan_expr(expr: &Expr, uses_print: &mut bool, uses_while: &mut bool) {
         ExprKind::Match { scrutinee, arms } => {
             scan_expr(scrutinee, uses_print, uses_while);
             for arm in arms {
+                if let Some(g) = &arm.guard {
+                    scan_expr(g, uses_print, uses_while);
+                }
                 scan_expr(&arm.body, uses_print, uses_while);
             }
         }
@@ -388,7 +401,9 @@ fn collect_calls_place(place: &crate::ir::Place, out: &mut BTreeSet<String>) {
     use crate::ir::Place;
     match place {
         Place::Local { .. } => {}
-        Place::Field { base, .. } => collect_calls_place(base, out),
+        Place::Field { base, .. } | Place::TupleField { base, .. } => {
+            collect_calls_place(base, out)
+        }
         Place::Index { base, index, .. } => {
             collect_calls_place(base, out);
             collect_calls_expr(index, out);
@@ -421,7 +436,14 @@ fn collect_calls_expr(expr: &Expr, out: &mut BTreeSet<String>) {
                 collect_calls_expr(a, out);
             }
         }
-        ExprKind::Field { base, .. } => collect_calls_expr(base, out),
+        ExprKind::MakeTuple(elems) => {
+            for e in elems {
+                collect_calls_expr(e, out);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            collect_calls_expr(base, out)
+        }
         ExprKind::Index { base, index } => {
             collect_calls_expr(base, out);
             collect_calls_expr(index, out);
@@ -443,6 +465,9 @@ fn collect_calls_expr(expr: &Expr, out: &mut BTreeSet<String>) {
         ExprKind::Match { scrutinee, arms } => {
             collect_calls_expr(scrutinee, out);
             for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_calls_expr(g, out);
+                }
                 collect_calls_expr(&arm.body, out);
             }
         }
